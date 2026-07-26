@@ -18,10 +18,14 @@ package org.apache.tika.pipes.grpc;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
+import java.util.UUID;
+import java.util.stream.Stream;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -87,6 +91,15 @@ class TikaGrpcServerImpl extends TikaGrpc.TikaImplBase {
 
     private static final String PIPES_ITERATOR_PREFIX = "pipesIterator:";
 
+    /**
+     * Internal fetcher id baked into an augmented config copy so the forked pipes
+     * worker can resolve ParseBytes payloads. Not part of the public v1 management API.
+     */
+    static final String PARSE_BYTES_FETCHER_ID = "__tika_grpc_parse_bytes";
+
+    /** Soft upper bound for ParseBytes payloads in this PoC (64 MiB). */
+    static final int PARSE_BYTES_MAX_BYTES = 64 * 1024 * 1024;
+
     PipesConfig pipesConfig;
     TikaGrpcConfig tikaGrpcConfig;
     PipesClient pipesClient;
@@ -95,6 +108,10 @@ class TikaGrpcServerImpl extends TikaGrpc.TikaImplBase {
     Path tikaConfigPath;
     PluginManager pluginManager;
     private IgniteStoreServer igniteStoreServer;
+    /** Temp dir holding in-flight ParseBytes payloads; deleted on shutdown. */
+    private Path parseBytesDir;
+    /** Augmented config copy that registers {@link #PARSE_BYTES_FETCHER_ID}; deleted on shutdown. */
+    private Path augmentedConfigPath;
 
     TikaGrpcServerImpl(String tikaConfigPath) throws TikaConfigException, IOException {
         this(tikaConfigPath, null);
@@ -107,6 +124,13 @@ class TikaGrpcServerImpl extends TikaGrpc.TikaImplBase {
         }
 
         Path configPath = tikaConfigFile.toPath();
+        // ParseBytes (TIKA-4795 PoC) needs a fetcher the FORKED worker can resolve.
+        // Runtime store writes do not reach the worker with the default in-memory config
+        // store, so every component loads an augmented copy of the config that registers
+        // an internal file-system fetcher rooted at a server temp directory.
+        this.parseBytesDir = Files.createTempDirectory("tika-grpc-parse-bytes");
+        this.augmentedConfigPath = augmentWithParseBytesFetcher(configPath, parseBytesDir);
+        configPath = this.augmentedConfigPath;
         this.tikaConfigPath = configPath;
 
         TikaJsonConfig tikaJsonConfig = TikaJsonConfig.load(configPath);
@@ -712,5 +736,101 @@ class TikaGrpcServerImpl extends TikaGrpc.TikaImplBase {
                 pipesClient = null;
             }
         }
+        deleteQuietly(augmentedConfigPath);
+        augmentedConfigPath = null;
+        deleteRecursivelyQuietly(parseBytesDir);
+        parseBytesDir = null;
+    }
+
+    /**
+     * Writes {@code content} under the internal ParseBytes fetcher root and runs the
+     * same pipes round trip as FetchAndParse. Caller must delete the returned temp file
+     * path when finished (see {@link #deleteQuietly(Path)}).
+     *
+     * @return outcome plus the on-disk temp path used as the fetch key, or {@code null}
+     *         if the calling thread was interrupted
+     */
+    ParseBytesOutcome runParseBytes(byte[] content, String resourceNameHint,
+                                    String parseContextJson) throws IOException {
+        if (content == null || content.length == 0) {
+            throw new IllegalArgumentException("content is required");
+        }
+        if (content.length > PARSE_BYTES_MAX_BYTES) {
+            throw new IllegalArgumentException(
+                    "content exceeds ParseBytes bound of " + PARSE_BYTES_MAX_BYTES + " bytes");
+        }
+        String safeHint = sanitizeResourceName(resourceNameHint);
+        String tempName = UUID.randomUUID() + (safeHint.isEmpty() ? "" : "-" + safeHint);
+        Path file = parseBytesDir.resolve(tempName);
+        Files.write(file, content);
+        try {
+            FetchParseOutcome outcome = runFetchAndParse(
+                    PARSE_BYTES_FETCHER_ID, tempName, null, parseContextJson);
+            if (outcome == null) {
+                deleteQuietly(file);
+                return null;
+            }
+            return new ParseBytesOutcome(outcome, file);
+        } catch (RuntimeException e) {
+            deleteQuietly(file);
+            throw e;
+        }
+    }
+
+    static void deleteQuietly(Path path) {
+        if (path == null) {
+            return;
+        }
+        try {
+            Files.deleteIfExists(path);
+        } catch (IOException e) {
+            LOG.debug("Could not delete {}", path, e);
+        }
+    }
+
+    private static void deleteRecursivelyQuietly(Path dir) {
+        if (dir == null || !Files.exists(dir)) {
+            return;
+        }
+        try (Stream<Path> walk = Files.walk(dir)) {
+            walk.sorted(Comparator.reverseOrder()).forEach(TikaGrpcServerImpl::deleteQuietly);
+        } catch (IOException e) {
+            LOG.warn("Could not clean ParseBytes temp dir {}", dir, e);
+        }
+    }
+
+    private static Path augmentWithParseBytesFetcher(Path configPath, Path dir) throws IOException {
+        com.fasterxml.jackson.databind.node.ObjectNode root =
+                (com.fasterxml.jackson.databind.node.ObjectNode) OBJECT_MAPPER.readTree(configPath.toFile());
+        com.fasterxml.jackson.databind.node.ObjectNode fetchers =
+                root.has("fetchers") && root.get("fetchers").isObject()
+                        ? (com.fasterxml.jackson.databind.node.ObjectNode) root.get("fetchers")
+                        : root.putObject("fetchers");
+        fetchers.putObject(PARSE_BYTES_FETCHER_ID)
+                .putObject("file-system-fetcher")
+                .put("basePath", dir.toAbsolutePath().toString());
+        Path augmented = Files.createTempFile("tika-grpc-config", ".json");
+        Files.writeString(augmented,
+                OBJECT_MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(root));
+        return augmented;
+    }
+
+    private static String sanitizeResourceName(String resourceName) {
+        if (resourceName == null || resourceName.isBlank()) {
+            return "";
+        }
+        String name = resourceName.replace('\\', '/');
+        int slash = name.lastIndexOf('/');
+        if (slash >= 0) {
+            name = name.substring(slash + 1);
+        }
+        // keep it a single path segment; drop characters that would confuse the fetcher key
+        return name.replaceAll("[^A-Za-z0-9._-]", "_");
+    }
+
+    /**
+     * Outcome of a ParseBytes pipes round trip, including the temp file to clean up.
+     */
+    record ParseBytesOutcome(FetchParseOutcome outcome, Path tempFile) {
     }
 }

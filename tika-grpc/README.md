@@ -27,8 +27,11 @@ The server exposes two gRPC services on the same port:
   fetch-and-parse replies that return the legacy `fields` map. Unchanged for
   current clients; whether/when to deprecate it is a separate maintainers' call.
 - **`org.apache.tika.grpc.v2.TikaV2` (experimental)** — typed parse replies that
-  return `org.apache.tika.grpc.v2.Document`. Fetcher management stays on v1;
-  additive follow-ups (ParseBytes, content tree, embedded recursion) extend v2.
+  return `org.apache.tika.grpc.v2.Document`. Fetcher management stays on v1.
+  Includes a TIKA-4795 **ParseBytes PoC** (parse-only bytes in, same `Document` out,
+  with `ParseBytesContext` packed into `Document.extensions` via `google.protobuf.Any`).
+  Implementation details of ParseBytes are intentionally open for the StormCrawler /
+  crawler discussion; this branch demonstrates the additive v2 shape.
 
 Rather than one proto message per source format, `Document` models metadata by
 concern:

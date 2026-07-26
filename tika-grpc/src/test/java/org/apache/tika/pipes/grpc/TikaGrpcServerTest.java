@@ -77,6 +77,9 @@ import org.apache.tika.SavePipesIteratorReply;
 import org.apache.tika.SavePipesIteratorRequest;
 import org.apache.tika.TikaGrpc;
 import org.apache.tika.grpc.v2.Document;
+import org.apache.tika.grpc.v2.ParseBytesContext;
+import org.apache.tika.grpc.v2.ParseBytesReply;
+import org.apache.tika.grpc.v2.ParseBytesRequest;
 import org.apache.tika.grpc.v2.TikaV2Grpc;
 import org.apache.tika.pipes.api.PipesResult;
 import org.apache.tika.pipes.fetcher.fs.FileSystemFetcher;
@@ -386,6 +389,47 @@ public class TikaGrpcServerTest {
     private static TikaGrpc.TikaBlockingStub startServer(Resources resources, Path config)
             throws Exception {
         return TikaGrpc.newBlockingStub(startChannel(resources, config));
+    }
+
+    /**
+     * TIKA-4795 PoC: ParseBytes needs no fetcher registration (works with component
+     * management denied), returns the same v2 Document, and packs ParseBytesContext
+     * into Document.extensions via google.protobuf.Any.
+     */
+    @Test
+    public void testParseBytesNeedsNoFetcherRegistration(Resources resources) throws Exception {
+        ManagedChannel channel = startChannel(resources, tikaConfig);
+        TikaV2Grpc.TikaV2BlockingStub v2 = TikaV2Grpc.newBlockingStub(channel);
+
+        ParseBytesReply reply = v2.parseBytes(ParseBytesRequest.newBuilder()
+                .setCorrelationId("bytes-1")
+                .setContent(com.google.protobuf.ByteString.copyFromUtf8(
+                        "<html><head><title>Bytes</title></head><body>Hello from raw bytes.</body></html>"))
+                .setResourceName("page.html")
+                .setSourceUri("https://example.com/page.html")
+                .setEffectiveUri("https://example.com/page.html")
+                .setBaseUri("https://example.com/")
+                .setDeclaredContentType("text/html")
+                .setTruncated(false)
+                .build());
+
+        assertEquals("bytes-1", reply.getCorrelationId());
+        Document document = reply.getDocument();
+        assertEquals("bytes-1", document.getId());
+        assertEquals("PARSE_SUCCESS", document.getStatus().getPipesStatus(),
+                "errors=" + document.getStatus().getErrorsList());
+        assertTrue(document.getContentType().startsWith("text/html"),
+                "detected content type, got: " + document.getContentType());
+        assertEquals("page.html", document.getOrigin().getFilename());
+        assertEquals("https://example.com/page.html", document.getOrigin().getSourceUri());
+        assertEquals(1, document.getExtensionsCount(),
+                "ParseBytes should pack one ParseBytesContext Any");
+
+        ParseBytesContext context = document.getExtensions(0).unpack(ParseBytesContext.class);
+        assertEquals("bytes-1", context.getCorrelationId());
+        assertEquals("https://example.com/page.html", context.getSourceUri());
+        assertEquals("text/html", context.getDeclaredContentType());
+        assertEquals("page.html", context.getResourceName());
     }
 
     /**

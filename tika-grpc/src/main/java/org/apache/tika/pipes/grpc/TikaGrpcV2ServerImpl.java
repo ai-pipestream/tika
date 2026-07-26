@@ -16,19 +16,29 @@
  */
 package org.apache.tika.pipes.grpc;
 
+import com.google.protobuf.Any;
 import io.grpc.stub.StreamObserver;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.tika.grpc.mapper.DocumentBuilder;
+import org.apache.tika.grpc.v2.Document;
 import org.apache.tika.grpc.v2.FetchAndParseReply;
 import org.apache.tika.grpc.v2.FetchAndParseRequest;
+import org.apache.tika.grpc.v2.ParseBytesContext;
+import org.apache.tika.grpc.v2.ParseBytesReply;
+import org.apache.tika.grpc.v2.ParseBytesRequest;
+import org.apache.tika.grpc.v2.SourceOrigin;
 import org.apache.tika.grpc.v2.TikaV2Grpc;
 
 /**
  * Experimental v2 parse surface. Reuses the same pipes/fetcher runtime as the v1
  * {@link TikaGrpcServerImpl}; fetcher management stays on v1. Replies carry the typed
- * {@link org.apache.tika.grpc.v2.Document} contract instead of the legacy fields map.
+ * {@link Document} contract instead of the legacy fields map.
+ *
+ * <p>Also hosts the TIKA-4795 ParseBytes PoC: parse-only entrypoint returning the same
+ * {@link Document}, with caller provenance packed into {@code Document.extensions} as
+ * {@link ParseBytesContext}.
  */
 class TikaGrpcV2ServerImpl extends TikaV2Grpc.TikaV2ImplBase {
 
@@ -84,6 +94,114 @@ class TikaGrpcV2ServerImpl extends TikaV2Grpc.TikaV2ImplBase {
                 responseObserver.onCompleted();
             }
         };
+    }
+
+    @Override
+    public void parseBytes(ParseBytesRequest request,
+                           StreamObserver<ParseBytesReply> responseObserver) {
+        if (request.getContent().isEmpty()) {
+            responseObserver.onError(io.grpc.Status.INVALID_ARGUMENT
+                    .withDescription("content is required")
+                    .asRuntimeException());
+            return;
+        }
+        if (request.getContent().size() > TikaGrpcServerImpl.PARSE_BYTES_MAX_BYTES) {
+            responseObserver.onError(io.grpc.Status.RESOURCE_EXHAUSTED
+                    .withDescription("content exceeds ParseBytes bound of "
+                            + TikaGrpcServerImpl.PARSE_BYTES_MAX_BYTES + " bytes")
+                    .asRuntimeException());
+            return;
+        }
+        if (v1.denyPerRequestConfig(null, request.getParseContextJson(), responseObserver)) {
+            return;
+        }
+
+        TikaGrpcServerImpl.ParseBytesOutcome parseBytesOutcome = null;
+        try {
+            parseBytesOutcome = v1.runParseBytes(
+                    request.getContent().toByteArray(),
+                    request.getResourceName(),
+                    request.getParseContextJson());
+            if (parseBytesOutcome == null) {
+                return;
+            }
+            TikaGrpcServerImpl.FetchParseOutcome outcome = parseBytesOutcome.outcome();
+            String documentId = request.getCorrelationId().isBlank()
+                    ? outcome.fetchKey()
+                    : request.getCorrelationId();
+
+            Document.Builder document = DocumentBuilder.build(
+                            outcome.primary(),
+                            documentId,
+                            outcome.status(),
+                            outcome.fetchParseTimeMs())
+                    .toBuilder();
+
+            SourceOrigin.Builder origin = document.getOriginBuilder();
+            if (!request.getResourceName().isBlank()) {
+                origin.setFilename(request.getResourceName());
+            }
+            origin.setByteSize(request.getContent().size());
+            if (!request.getSourceUri().isBlank()) {
+                origin.setSourceUri(request.getSourceUri());
+            }
+            if (!request.getEffectiveUri().isBlank()) {
+                origin.setEffectiveUri(request.getEffectiveUri());
+            }
+            if (!request.getBaseUri().isBlank()) {
+                origin.setBaseUri(request.getBaseUri());
+            }
+            origin.setTruncated(request.getTruncated());
+            if (!request.getDeclaredSha256().isBlank() && origin.getSha256().isBlank()) {
+                origin.setSha256(request.getDeclaredSha256());
+            }
+            document.setOrigin(origin);
+
+            // Demonstrate the Any extension slot: pack typed ParseBytes provenance so
+            // consumers can unpack by type URL without growing Document's core fields.
+            ParseBytesContext.Builder context = ParseBytesContext.newBuilder()
+                    .setTruncated(request.getTruncated());
+            if (!request.getCorrelationId().isBlank()) {
+                context.setCorrelationId(request.getCorrelationId());
+            }
+            if (!request.getSourceUri().isBlank()) {
+                context.setSourceUri(request.getSourceUri());
+            }
+            if (!request.getEffectiveUri().isBlank()) {
+                context.setEffectiveUri(request.getEffectiveUri());
+            }
+            if (!request.getBaseUri().isBlank()) {
+                context.setBaseUri(request.getBaseUri());
+            }
+            if (!request.getDeclaredContentType().isBlank()) {
+                context.setDeclaredContentType(request.getDeclaredContentType());
+            }
+            if (!request.getDeclaredCharset().isBlank()) {
+                context.setDeclaredCharset(request.getDeclaredCharset());
+            }
+            if (!request.getResourceName().isBlank()) {
+                context.setResourceName(request.getResourceName());
+            }
+            document.addExtensions(Any.pack(context.build()));
+
+            ParseBytesReply.Builder reply = ParseBytesReply.newBuilder()
+                    .setDocument(document);
+            if (!request.getCorrelationId().isBlank()) {
+                reply.setCorrelationId(request.getCorrelationId());
+            }
+            responseObserver.onNext(reply.build());
+            responseObserver.onCompleted();
+        } catch (IllegalArgumentException e) {
+            responseObserver.onError(io.grpc.Status.INVALID_ARGUMENT
+                    .withDescription(e.getMessage())
+                    .asRuntimeException());
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        } finally {
+            if (parseBytesOutcome != null) {
+                TikaGrpcServerImpl.deleteQuietly(parseBytesOutcome.tempFile());
+            }
+        }
     }
 
     private void fetchAndParseImpl(FetchAndParseRequest request,

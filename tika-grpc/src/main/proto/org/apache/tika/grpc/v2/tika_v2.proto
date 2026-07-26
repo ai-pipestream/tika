@@ -37,6 +37,11 @@ service TikaV2 {
       returns (stream FetchAndParseReply) {}
   rpc FetchAndParseBiDirectionalStreaming(stream FetchAndParseRequest)
       returns (stream FetchAndParseReply) {}
+
+  // Parse-only entrypoint (TIKA-4795 PoC): parse the exact bytes the caller already
+  // holds. No fetcher registration. Reply is the same Document contract; ParseBytes
+  // provenance is also packed into Document.extensions as ParseBytesContext.
+  rpc ParseBytes(ParseBytesRequest) returns (ParseBytesReply) {}
 }
 
 message FetchAndParseRequest {
@@ -51,5 +56,33 @@ message FetchAndParseRequest {
 
 message FetchAndParseReply {
   string fetch_key = 1;
+  Document document = 2;
+}
+
+message ParseBytesRequest {
+  // Opaque caller correlation id. Echoed as Document.id and ParseBytesReply.correlation_id
+  // when set; never interpreted by the service.
+  string correlation_id = 1;
+  // Exact bytes to parse. Required; must be non-empty and within the server bound.
+  bytes content = 2;
+  // Optional resource name (e.g. "page.html") used as a detection/name hint.
+  string resource_name = 3;
+  // Provenance: never dereferenced by the service.
+  string source_uri = 4;
+  string effective_uri = 5;
+  string base_uri = 6;
+  // Declared media type / charset hints from the acquisition path.
+  string declared_content_type = 7;
+  string declared_charset = 8;
+  // Optional caller-declared length / digest for later validation experiments.
+  int64 declared_content_length = 9;
+  string declared_sha256 = 10;
+  bool truncated = 11;
+  // Optional JSON object to configure the ParseContext for this request.
+  string parse_context_json = 12;
+}
+
+message ParseBytesReply {
+  string correlation_id = 1;
   Document document = 2;
 }

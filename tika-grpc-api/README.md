@@ -53,8 +53,13 @@ change.
 Planned follow-ups extend `Document` additively (proto3 field additions are
 wire-compatible): a structured content tree, and recursion into embedded documents.
 Field numbers for those are intentionally left unassigned in `document.proto`.
-Parse-only entrypoints such as ParseBytes are separate issues that reuse this same
-`Document` reply on the v2 service.
+
+`Document.extensions` (`repeated google.protobuf.Any`) is the typed escape hatch for
+side-channel payloads (ParseBytes provenance today; layout/NLP later) without growing
+the core schema. Unpack by type URL.
+
+ParseBytes (TIKA-4795) is prototyped on `TikaV2` in `tika-grpc` and reuses this same
+`Document` reply.
 
 ## Lint
 

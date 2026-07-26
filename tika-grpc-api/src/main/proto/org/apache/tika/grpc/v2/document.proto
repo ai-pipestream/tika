@@ -31,6 +31,7 @@ syntax = "proto3";
 
 package org.apache.tika.grpc.v2;
 
+import "google/protobuf/any.proto";
 import "google/protobuf/timestamp.proto";
 
 option java_multiple_files = true;
@@ -48,6 +49,12 @@ message Document {
   DocumentMetadata metadata = 20;      // typed common fields
   repeated MetadataField extra = 21;   // tagged tail: everything not already typed
 
+  // Extension payloads packed by producers/mappers that want typed side-channels
+  // without forcing a Document schema change (ParseBytes provenance today; layout,
+  // NLP, or embedder payloads later). Consumers unpack by type URL. Field number 40
+  // stays clear of the reserved content-tree / embedded ranges (3, 10-19, 30+).
+  repeated google.protobuf.Any extensions = 40;
+
   // Field numbers 3, 10-19, and 30+ are intentionally unassigned: planned additive
   // features (structured content blocks, embedded-document recursion) claim them
   // without renumbering anything that has shipped.
@@ -62,6 +69,27 @@ message SourceOrigin {
   // digester configured. Downstream consumers use it to tie derived artifacts
   // (annotations, index entries) back to the exact bytes that were parsed.
   string sha256 = 4;
+
+  // Caller-supplied provenance for parse-only entrypoints (e.g. ParseBytes). These
+  // are never dereferenced by the service; they describe the representation the
+  // caller already captured.
+  string source_uri = 5;
+  string effective_uri = 6;
+  string base_uri = 7;
+  bool truncated = 8;
+}
+
+// Typed extension example packed into Document.extensions by ParseBytes. Other
+// producers may pack different messages; the Any type URL is the discriminator.
+message ParseBytesContext {
+  string correlation_id = 1;
+  string source_uri = 2;
+  string effective_uri = 3;
+  string base_uri = 4;
+  bool truncated = 5;
+  string declared_content_type = 6;
+  string declared_charset = 7;
+  string resource_name = 8;
 }
 
 // =========================================================================
