@@ -14,25 +14,30 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.tika.parser.pdf.xmpschemas;
+package org.apache.tika.pipes.solr.tests;
 
-import org.apache.jempbox.xmp.XMPMetadata;
-import org.apache.jempbox.xmp.XMPSchema;
-import org.w3c.dom.Element;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
-public class XMPSchemaPDFXId extends XMPSchema {
-    public static final String NAMESPACE_URI = "http://www.npes.org/pdfx/ns/id/";
-    public static final String NAMESPACE = "pdfxid";
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Disabled;
+import org.testcontainers.junit.jupiter.Testcontainers;
 
-    public XMPSchemaPDFXId(XMPMetadata parent) {
-        super(parent, NAMESPACE, NAMESPACE_URI);
+import org.apache.tika.utils.SystemUtils;
+
+@Disabled("until we can fix SessionExpiredException")
+@Testcontainers(disabledWithoutDocker = true)
+public class TikaPipesSolr10ZkTest extends TikaPipesSolr10Test {
+
+    @BeforeAll
+    public static void setUp() {
+        assumeTrue(
+                SystemUtils.IS_OS_UNIX && !SystemUtils.IS_OS_MAC_OSX,
+                "zk test only works on linux (and not mac os x)");
     }
 
-    public XMPSchemaPDFXId(Element element, String prefix) {
-        super(element, prefix);
+    @Override
+    public boolean useZk() {
+        return true;
     }
 
-    public String getPDFXVersion() {
-        return this.getTextProperty(this.prefix + ":GTS_PDFXVersion");
-    }
 }
