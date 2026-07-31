@@ -509,6 +509,65 @@ public class TikaGrpcServerTest {
     }
 
     /**
+     * The ParseBytes fetcher is server-internal: through every public surface it behaves
+     * like an id that does not exist -- absent from list, NOT_FOUND on get, success=false
+     * on delete, refused on save, and not selectable as a FetchAndParse fetcher id.
+     * ParseBytes itself keeps working, because it alone may use it.
+     */
+    @Test
+    public void testInternalParseBytesFetcherIsNotPubliclyReachable(Resources resources)
+            throws Exception {
+        ManagedChannel channel = startChannel(resources, tikaConfigUnlocked);
+        TikaGrpc.TikaBlockingStub v1 = TikaGrpc.newBlockingStub(channel);
+        TikaV2Grpc.TikaV2BlockingStub v2 = TikaV2Grpc.newBlockingStub(channel);
+        String internal = TikaGrpcServerImpl.PARSE_BYTES_FETCHER_ID;
+        String unknown = "no-such-fetcher-" + UUID.randomUUID();
+
+        ListFetchersReply listed = v1.listFetchers(ListFetchersRequest.newBuilder().build());
+        assertTrue(listed.getGetFetcherRepliesList().stream()
+                        .noneMatch(f -> f.getFetcherId().equals(internal)),
+                "the internal fetcher must not be enumerable");
+
+        for (String id : new String[] {internal, unknown}) {
+            StatusRuntimeException ex = Assertions.assertThrows(StatusRuntimeException.class,
+                    () -> v1.getFetcher(GetFetcherRequest.newBuilder().setFetcherId(id).build()));
+            assertEquals(Status.Code.NOT_FOUND, ex.getStatus().getCode(), "get " + id);
+        }
+
+        for (String id : new String[] {internal, unknown}) {
+            DeleteFetcherReply del = v1.deleteFetcher(
+                    DeleteFetcherRequest.newBuilder().setFetcherId(id).build());
+            Assertions.assertFalse(del.getSuccess(), "delete " + id);
+        }
+
+        StatusRuntimeException saveEx = Assertions.assertThrows(StatusRuntimeException.class,
+                () -> v1.saveFetcher(SaveFetcherRequest.newBuilder()
+                        .setFetcherId(internal)
+                        .setFetcherType("file-system-fetcher")
+                        .setFetcherConfigJson("{\"basePath\":\"/tmp\"}")
+                        .build()));
+        assertEquals(Status.Code.INVALID_ARGUMENT, saveEx.getStatus().getCode());
+
+        // The internal id is not selectable as a FetchAndParse fetcher: it fails the same
+        // way an id that was never registered fails.
+        for (String id : new String[] {internal, unknown}) {
+            StatusRuntimeException ex = Assertions.assertThrows(StatusRuntimeException.class,
+                    () -> v1.fetchAndParse(FetchAndParseRequest.newBuilder()
+                            .setFetcherId(id)
+                            .setFetchKey("parse-bytes-probe")
+                            .build()));
+            assertEquals(Status.Code.UNKNOWN, ex.getStatus().getCode(), "fetch " + id);
+        }
+
+        ParseBytesReply reply = v2.parseBytes(ParseBytesRequest.newBuilder()
+                .setCorrelationId("crud-1")
+                .setContent(ByteString.copyFromUtf8("<html><body>still here</body></html>"))
+                .build());
+        assertEquals("PARSE_SUCCESS", reply.getDocument().getStatus().getPipesStatus(),
+                "ParseBytes must still work after management and fetch attempts on its fetcher");
+    }
+
+    /**
      * The stage-1 typed contract on the experimental v2 service (real forked pipes
      * worker, real proto round trip): Document carries the typed envelope, Dublin Core
      * metadata, and a lossless tagged tail that never double-ships what already has a

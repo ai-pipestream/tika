@@ -164,7 +164,7 @@ class TikaGrpcV2ServerImpl extends TikaV2Grpc.TikaV2ImplBase {
 
     private void fetchAndParseImpl(FetchAndParseRequest request,
                                    StreamObserver<FetchAndParseReply> responseObserver) {
-        TikaGrpcServerImpl.FetchParseOutcome outcome = v1.runFetchAndParse(
+        TikaGrpcServerImpl.FetchParseOutcome outcome = v1.runPublicFetchAndParse(
                 request.getFetcherId(),
                 request.getFetchKey(),
                 request.getAdditionalFetchConfigJson(),

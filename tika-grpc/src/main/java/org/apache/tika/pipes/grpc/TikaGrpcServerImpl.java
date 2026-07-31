@@ -319,7 +319,7 @@ class TikaGrpcServerImpl extends TikaGrpc.TikaImplBase {
 
     private void fetchAndParseImpl(FetchAndParseRequest request,
                                    StreamObserver<FetchAndParseReply> responseObserver) {
-        FetchParseOutcome outcome = runFetchAndParse(
+        FetchParseOutcome outcome = runPublicFetchAndParse(
                 request.getFetcherId(),
                 request.getFetchKey(),
                 request.getAdditionalFetchConfigJson(),
@@ -339,22 +339,35 @@ class TikaGrpcServerImpl extends TikaGrpc.TikaImplBase {
     }
 
     /**
-     * Shared pipes round-trip used by the v1 {@code fields}-map reply and the v2 typed
-     * {@code Document} reply. Returns primary metadata as {@code null} when the pipes
-     * result carried no metadata list (so the v2 builder can distinguish empty output
-     * from an empty {@link Metadata} object).
+     * The public FetchAndParse entry point: every v1 and v2 fetch RPC, unary and
+     * streaming, resolves its caller-supplied fetcher id here. Returns primary metadata
+     * as {@code null} when the pipes result carried no metadata list (so the v2 builder
+     * can distinguish empty output from an empty {@link Metadata} object).
+     *
+     * <p>The internal ParseBytes fetcher is not selectable through this method: it fails
+     * the way an id that was never registered fails. That closes the internal id as a
+     * route to the spool directory; it is not a claim that the directory is unreachable
+     * under every possible configuration.
      */
-    FetchParseOutcome runFetchAndParse(String fetcherId, String fetchKey,
-                                       String additionalFetchConfigJson,
-                                       String parseContextJson) {
+    FetchParseOutcome runPublicFetchAndParse(String fetcherId, String fetchKey,
+                                             String additionalFetchConfigJson,
+                                             String parseContextJson) {
+        if (PARSE_BYTES_FETCHER_ID.equals(fetcherId)) {
+            throw new RuntimeException("Could not find fetcher with name " + fetcherId);
+        }
         return runFetchAndParse(fetcherId, fetchKey, additionalFetchConfigJson,
                 parseContextJson, new Metadata());
     }
 
     /**
-     * As {@link #runFetchAndParse(String, String, String, String)}, but seeds the tuple
-     * with caller-supplied metadata. ParseBytes uses this to carry the logical resource
-     * name, which its opaque spool filename deliberately does not encode.
+     * As {@link #runPublicFetchAndParse(String, String, String, String)}, but seeds the
+     * tuple with caller-supplied metadata. ParseBytes uses this to carry the logical
+     * resource name, which its opaque spool filename deliberately does not encode.
+     *
+     * <p><strong>Privileged:</strong> this overload performs no fetcher-id filtering, so
+     * it can resolve the internal ParseBytes fetcher. Only ParseBytes may call it; any
+     * new RPC must go through {@link #runPublicFetchAndParse(String, String, String,
+     * String)} instead.
      */
     FetchParseOutcome runFetchAndParse(String fetcherId, String fetchKey,
                                        String additionalFetchConfigJson,
@@ -442,6 +455,15 @@ class TikaGrpcServerImpl extends TikaGrpc.TikaImplBase {
         if (denyComponentManagement(responseObserver)) {
             return;
         }
+        // Internal ParseBytes fetcher: must not be replaced. Save has no unknown-id
+        // twin (an unknown id creates a fetcher), so refuse neutrally; the residual
+        // observability is a deliberate, registered trade-off.
+        if (PARSE_BYTES_FETCHER_ID.equals(request.getFetcherId())) {
+            responseObserver.onError(io.grpc.Status.INVALID_ARGUMENT
+                    .withDescription("invalid fetcher id")
+                    .asRuntimeException());
+            return;
+        }
         String fetcherType = request.getFetcherType();
         if (!isRegisteredFetcherType(fetcherType)) {
             responseObserver.onError(io.grpc.Status.INVALID_ARGUMENT
@@ -498,6 +520,12 @@ class TikaGrpcServerImpl extends TikaGrpc.TikaImplBase {
     @Override
     public void getFetcher(GetFetcherRequest request,
                            StreamObserver<GetFetcherReply> responseObserver) {
+        // Internal ParseBytes fetcher: identical answer to an id that does not exist.
+        if (PARSE_BYTES_FETCHER_ID.equals(request.getFetcherId())) {
+            responseObserver.onError(StatusProto.toStatusException(
+                    notFoundStatus(request.getFetcherId())));
+            return;
+        }
         GetFetcherReply.Builder getFetcherReply = GetFetcherReply.newBuilder();
         try {
             Fetcher fetcher = fetcherManager.getFetcher(request.getFetcherId());
@@ -528,6 +556,10 @@ class TikaGrpcServerImpl extends TikaGrpc.TikaImplBase {
         // The config may carry secrets; only include it once component management is enabled.
         boolean includeConfig = tikaGrpcConfig.isAllowComponentManagement();
         for (String fetcherId : fetcherManager.getSupported()) {
+            // Internal ParseBytes fetcher: not enumerable.
+            if (PARSE_BYTES_FETCHER_ID.equals(fetcherId)) {
+                continue;
+            }
             try {
                 Fetcher fetcher = fetcherManager.getFetcher(fetcherId);
                 ExtensionConfig config = fetcher.getExtensionConfig();
@@ -553,6 +585,13 @@ class TikaGrpcServerImpl extends TikaGrpc.TikaImplBase {
     public void deleteFetcher(DeleteFetcherRequest request,
                               StreamObserver<DeleteFetcherReply> responseObserver) {
         if (denyComponentManagement(responseObserver)) {
+            return;
+        }
+        // Internal ParseBytes fetcher: identical answer to an id that does not exist
+        // (success=false, no error).
+        if (PARSE_BYTES_FETCHER_ID.equals(request.getFetcherId())) {
+            responseObserver.onNext(DeleteFetcherReply.newBuilder().setSuccess(false).build());
+            responseObserver.onCompleted();
             return;
         }
         boolean successfulDelete = deleteFetcher(request.getFetcherId());
