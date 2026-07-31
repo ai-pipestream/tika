@@ -78,7 +78,6 @@ import org.apache.tika.SavePipesIteratorReply;
 import org.apache.tika.SavePipesIteratorRequest;
 import org.apache.tika.TikaGrpc;
 import org.apache.tika.grpc.v2.Document;
-import org.apache.tika.grpc.v2.ParseBytesContext;
 import org.apache.tika.grpc.v2.ParseBytesReply;
 import org.apache.tika.grpc.v2.ParseBytesRequest;
 import org.apache.tika.grpc.v2.TikaV2Grpc;
@@ -414,8 +413,7 @@ public class TikaGrpcServerTest {
 
     /**
      * TIKA-4795 PoC: ParseBytes needs no fetcher registration (works with component
-     * management denied), returns the same v2 Document, and packs ParseBytesContext
-     * into Document.extensions via google.protobuf.Any.
+     * management denied) and returns the same v2 Document.
      */
     @Test
     public void testParseBytesNeedsNoFetcherRegistration(Resources resources) throws Exception {
@@ -430,7 +428,6 @@ public class TikaGrpcServerTest {
                 .setSourceUri("https://example.com/page.html")
                 .setEffectiveUri("https://example.com/page.html")
                 .setBaseUri("https://example.com/")
-                .setDeclaredContentType("text/html")
                 .setTruncated(false)
                 .build());
 
@@ -443,14 +440,6 @@ public class TikaGrpcServerTest {
                 "detected content type, got: " + document.getContentType());
         assertEquals("page.html", document.getOrigin().getFilename());
         assertEquals("https://example.com/page.html", document.getOrigin().getSourceUri());
-        assertEquals(1, document.getExtensionsCount(),
-                "ParseBytes should pack one ParseBytesContext Any");
-
-        ParseBytesContext context = document.getExtensions(0).unpack(ParseBytesContext.class);
-        assertEquals("bytes-1", context.getCorrelationId());
-        assertEquals("https://example.com/page.html", context.getSourceUri());
-        assertEquals("text/html", context.getDeclaredContentType());
-        assertEquals("page.html", context.getResourceName());
     }
 
     /**
@@ -491,23 +480,6 @@ public class TikaGrpcServerTest {
                 .build());
         assertEquals("", anonymous.getDocument().getOrigin().getFilename(),
                 "with no resource name supplied, none may be invented from the spool file");
-    }
-
-    /** origin.sha256 is pipeline-recorded (document.proto): a declared digest is never copied. */
-    @Test
-    public void testParseBytesDeclaredDigestIsNeverCopied(Resources resources) throws Exception {
-        ManagedChannel channel = startChannel(resources, tikaConfig);
-        TikaV2Grpc.TikaV2BlockingStub v2 = TikaV2Grpc.newBlockingStub(channel);
-
-        ParseBytesReply reply = v2.parseBytes(ParseBytesRequest.newBuilder()
-                .setCorrelationId("digest-declared")
-                .setContent(ByteString.copyFromUtf8("<html><body>d</body></html>"))
-                .setDeclaredSha256(
-                        "0000000000000000000000000000000000000000000000000000000000000000")
-                .build());
-
-        assertTrue(reply.getDocument().getOrigin().getSha256().isEmpty(),
-                "origin.sha256 is pipeline-recorded; a caller-declared value is never copied");
     }
 
     private static String sha256Hex(byte[] bytes) throws Exception {

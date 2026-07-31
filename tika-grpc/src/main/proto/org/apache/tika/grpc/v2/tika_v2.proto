@@ -39,8 +39,7 @@ service TikaV2 {
       returns (stream FetchAndParseReply) {}
 
   // Parse-only entrypoint (TIKA-4795 PoC): parse the exact bytes the caller already
-  // holds. No fetcher registration. Reply is the same Document contract; ParseBytes
-  // provenance is also packed into Document.extensions as ParseBytesContext.
+  // holds. No fetcher registration. Reply is the same Document contract.
   rpc ParseBytes(ParseBytesRequest) returns (ParseBytesReply) {}
 }
 
@@ -71,12 +70,9 @@ message ParseBytesRequest {
   string source_uri = 4;
   string effective_uri = 5;
   string base_uri = 6;
-  // Declared media type / charset hints from the acquisition path.
-  string declared_content_type = 7;
-  string declared_charset = 8;
-  // Optional caller-declared length / digest for later validation experiments.
-  int64 declared_content_length = 9;
-  string declared_sha256 = 10;
+  // Field numbers 7-10 held for declared hints/integrity (content type, charset,
+  // length, digest) -- semantics under discussion on TIKA-4795; reintroduced only
+  // with verifiable semantics and tests of their own.
   bool truncated = 11;
   // Optional JSON object to configure the ParseContext for this request.
   string parse_context_json = 12;

@@ -16,7 +16,6 @@
  */
 package org.apache.tika.pipes.grpc;
 
-import com.google.protobuf.Any;
 import io.grpc.stub.StreamObserver;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -25,7 +24,6 @@ import org.apache.tika.grpc.mapper.DocumentBuilder;
 import org.apache.tika.grpc.v2.Document;
 import org.apache.tika.grpc.v2.FetchAndParseReply;
 import org.apache.tika.grpc.v2.FetchAndParseRequest;
-import org.apache.tika.grpc.v2.ParseBytesContext;
 import org.apache.tika.grpc.v2.ParseBytesReply;
 import org.apache.tika.grpc.v2.ParseBytesRequest;
 import org.apache.tika.grpc.v2.SourceOrigin;
@@ -37,8 +35,7 @@ import org.apache.tika.grpc.v2.TikaV2Grpc;
  * {@link Document} contract instead of the legacy fields map.
  *
  * <p>Also hosts the TIKA-4795 ParseBytes PoC: parse-only entrypoint returning the same
- * {@link Document}, with caller provenance packed into {@code Document.extensions} as
- * {@link ParseBytesContext}.
+ * {@link Document}, with caller provenance carried on {@code SourceOrigin}.
  */
 class TikaGrpcV2ServerImpl extends TikaV2Grpc.TikaV2ImplBase {
 
@@ -148,33 +145,6 @@ class TikaGrpcV2ServerImpl extends TikaV2Grpc.TikaV2ImplBase {
             }
             origin.setTruncated(request.getTruncated());
             document.setOrigin(origin);
-
-            // Demonstrate the Any extension slot: pack typed ParseBytes provenance so
-            // consumers can unpack by type URL without growing Document's core fields.
-            ParseBytesContext.Builder context = ParseBytesContext.newBuilder()
-                    .setTruncated(request.getTruncated());
-            if (!request.getCorrelationId().isEmpty()) {
-                context.setCorrelationId(request.getCorrelationId());
-            }
-            if (!request.getSourceUri().isBlank()) {
-                context.setSourceUri(request.getSourceUri());
-            }
-            if (!request.getEffectiveUri().isBlank()) {
-                context.setEffectiveUri(request.getEffectiveUri());
-            }
-            if (!request.getBaseUri().isBlank()) {
-                context.setBaseUri(request.getBaseUri());
-            }
-            if (!request.getDeclaredContentType().isBlank()) {
-                context.setDeclaredContentType(request.getDeclaredContentType());
-            }
-            if (!request.getDeclaredCharset().isBlank()) {
-                context.setDeclaredCharset(request.getDeclaredCharset());
-            }
-            if (!request.getResourceName().isBlank()) {
-                context.setResourceName(request.getResourceName());
-            }
-            document.addExtensions(Any.pack(context.build()));
 
             ParseBytesReply.Builder reply = ParseBytesReply.newBuilder()
                     .setDocument(document);
