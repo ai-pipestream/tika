@@ -24,7 +24,6 @@ import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
-import java.util.UUID;
 import java.util.stream.Stream;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
@@ -65,6 +64,7 @@ import org.apache.tika.config.loader.TikaJsonConfig;
 import org.apache.tika.exception.TikaConfigException;
 import org.apache.tika.exception.TikaException;
 import org.apache.tika.metadata.Metadata;
+import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.parser.ParseContext;
 import org.apache.tika.pipes.api.FetchEmitTuple;
 import org.apache.tika.pipes.api.PipesResult;
@@ -109,7 +109,7 @@ class TikaGrpcServerImpl extends TikaGrpc.TikaImplBase {
     PluginManager pluginManager;
     private IgniteStoreServer igniteStoreServer;
     /** Temp dir holding in-flight ParseBytes payloads; deleted on shutdown. */
-    private Path parseBytesDir;
+    Path parseBytesDir;   // package-private for TikaGrpcV2ParseBytesUnitTest
     /** Augmented config copy that registers {@link #PARSE_BYTES_FETCHER_ID}; deleted on shutdown. */
     private Path augmentedConfigPath;
 
@@ -347,6 +347,18 @@ class TikaGrpcServerImpl extends TikaGrpc.TikaImplBase {
     FetchParseOutcome runFetchAndParse(String fetcherId, String fetchKey,
                                        String additionalFetchConfigJson,
                                        String parseContextJson) {
+        return runFetchAndParse(fetcherId, fetchKey, additionalFetchConfigJson,
+                parseContextJson, new Metadata());
+    }
+
+    /**
+     * As {@link #runFetchAndParse(String, String, String, String)}, but seeds the tuple
+     * with caller-supplied metadata. ParseBytes uses this to carry the logical resource
+     * name, which its opaque spool filename deliberately does not encode.
+     */
+    FetchParseOutcome runFetchAndParse(String fetcherId, String fetchKey,
+                                       String additionalFetchConfigJson,
+                                       String parseContextJson, Metadata tikaMetadata) {
         Fetcher fetcher;
         try {
             fetcher = fetcherManager.getFetcher(fetcherId);
@@ -354,7 +366,6 @@ class TikaGrpcServerImpl extends TikaGrpc.TikaImplBase {
             throw new RuntimeException("Could not find fetcher with name " + fetcherId, e);
         }
 
-        Metadata tikaMetadata = new Metadata();
         // Times the whole pipesClient.process() round trip: fetch and parse both happen
         // inside the forked pipes worker, so this is fetch+parse latency, not parse-only.
         long fetchParseStart = System.nanoTime();
@@ -743,12 +754,19 @@ class TikaGrpcServerImpl extends TikaGrpc.TikaImplBase {
     }
 
     /**
-     * Writes {@code content} under the internal ParseBytes fetcher root and runs the
-     * same pipes round trip as FetchAndParse. Caller must delete the returned temp file
-     * path when finished (see {@link #deleteQuietly(Path)}).
+     * Writes {@code content} to an opaque, extensionless spool file under the internal
+     * ParseBytes fetcher root and runs the same pipes round trip as FetchAndParse. The
+     * returned outcome owns the spool file: every path out of this method deletes it
+     * except a successful transfer, and the caller releases it via
+     * {@link ParseBytesOutcome#close()} (idempotent). No reply field is derived from
+     * the spool identity.
      *
-     * @return outcome plus the on-disk temp path used as the fetch key, or {@code null}
-     *         if the calling thread was interrupted
+     * <p>The spool file gets an opaque server-side name; {@code resourceNameHint} travels
+     * as metadata instead, which the pipes worker preserves across its fresh-metadata
+     * boundary. Caller names therefore never have to satisfy filesystem constraints.
+     *
+     * @return the outcome owning the spool file, or {@code null} if the calling thread
+     *         was interrupted before a reply could be built
      */
     ParseBytesOutcome runParseBytes(byte[] content, String resourceNameHint,
                                     String parseContextJson) throws IOException {
@@ -759,22 +777,76 @@ class TikaGrpcServerImpl extends TikaGrpc.TikaImplBase {
             throw new IllegalArgumentException(
                     "content exceeds ParseBytes bound of " + PARSE_BYTES_MAX_BYTES + " bytes");
         }
-        String safeHint = sanitizeResourceName(resourceNameHint);
-        String tempName = UUID.randomUUID() + (safeHint.isEmpty() ? "" : "-" + safeHint);
-        Path file = parseBytesDir.resolve(tempName);
-        Files.write(file, content);
+        // createTempFile creates the file up front, so every path out of here that does
+        // not hand it to the caller has to delete it -- a failed write included.
+        Path file = Files.createTempFile(parseBytesDir, "parse-bytes-", "");
+        boolean transferred = false;
         try {
-            FetchParseOutcome outcome = runFetchAndParse(
-                    PARSE_BYTES_FETCHER_ID, tempName, null, parseContextJson);
+            Files.write(file, content);
+            Metadata tikaMetadata = new Metadata();
+            if (resourceNameHint != null && !resourceNameHint.isBlank()) {
+                tikaMetadata.set(TikaCoreProperties.RESOURCE_NAME_KEY, resourceNameHint.trim());
+            }
+            FetchParseOutcome outcome = runFetchAndParse(PARSE_BYTES_FETCHER_ID,
+                    file.getFileName().toString(), null, parseContextJson, tikaMetadata);
             if (outcome == null) {
-                deleteQuietly(file);
                 return null;
             }
-            return new ParseBytesOutcome(outcome, file);
-        } catch (RuntimeException e) {
-            deleteQuietly(file);
-            throw e;
+            // Build fully before claiming the transfer: if anything here throws, the
+            // finally below still owns the file.
+            ParseBytesOutcome parseBytesOutcome = new ParseBytesOutcome(
+                    sanitizedCopy(outcome.primary(), resourceNameHint),
+                    outcome.status(),
+                    outcome.fetchParseTimeMs(),
+                    file);
+            transferred = true;
+            return parseBytesOutcome;
+        } finally {
+            if (!transferred) {
+                deleteQuietly(file);
+            }
         }
+    }
+
+    /**
+     * Copies the parse metadata without the two traces the spool file leaves in it: the
+     * fetcher records the fetch key as {@code X-TIKA:sourcePath}, and Tika falls back to
+     * the spool filename as the resource name when the caller supplied none. The copy is
+     * owned by the outcome, so nothing downstream shares state with the pipes result.
+     *
+     * <p>The copy is written as a trusted transformation target, which is what
+     * {@link Metadata#setTrusted(boolean)} exists for: plain writes drop reserved
+     * {@code X-TIKA:} keys such as {@code X-TIKA:Parsed-By} and the observed digest.
+     *
+     * @return {@code null} when {@code source} is null, since that is how the mapper
+     *         distinguishes "pipes returned no metadata" from an empty document
+     */
+    private static Metadata sanitizedCopy(Metadata source, String resourceNameHint) {
+        if (source == null) {
+            // null means "pipes returned no metadata at all" and DocumentBuilder relies on
+            // that distinction; an empty Metadata would report a failure as an empty
+            // document.
+            return null;
+        }
+        Metadata copy = new Metadata();
+        boolean dropResourceName = resourceNameHint == null || resourceNameHint.isBlank();
+        String sourcePathKey = TikaCoreProperties.SOURCE_PATH.getName();
+        String resourceNameKey = TikaCoreProperties.RESOURCE_NAME_KEY.getName();
+        copy.setTrusted(true);
+        try {
+            for (String name : source.names()) {
+                if (name.equals(sourcePathKey)
+                        || (dropResourceName && name.equals(resourceNameKey))) {
+                    continue;
+                }
+                for (String value : source.getValues(name)) {
+                    copy.add(name, value);
+                }
+            }
+        } finally {
+            copy.setTrusted(false);
+        }
+        return copy;
     }
 
     static void deleteQuietly(Path path) {
@@ -815,22 +887,43 @@ class TikaGrpcServerImpl extends TikaGrpc.TikaImplBase {
         return augmented;
     }
 
-    private static String sanitizeResourceName(String resourceName) {
-        if (resourceName == null || resourceName.isBlank()) {
-            return "";
-        }
-        String name = resourceName.replace('\\', '/');
-        int slash = name.lastIndexOf('/');
-        if (slash >= 0) {
-            name = name.substring(slash + 1);
-        }
-        // keep it a single path segment; drop characters that would confuse the fetcher key
-        return name.replaceAll("[^A-Za-z0-9._-]", "_");
-    }
-
     /**
-     * Outcome of a ParseBytes pipes round trip, including the temp file to clean up.
+     * What ParseBytes hands to the v2 reply builder: sanitized parse metadata, the pipes
+     * status, the round-trip time, and the ability to release the spool file -- nothing
+     * else. Deliberately not a wrapper around {@link FetchParseOutcome}, whose fetch key
+     * is the spool filename and whose flattened {@code fields} map is neither sanitized
+     * nor limited to the container document.
      */
-    record ParseBytesOutcome(FetchParseOutcome outcome, Path tempFile) {
+    static final class ParseBytesOutcome implements AutoCloseable {
+        private final Metadata primary;
+        private final String status;
+        private final long fetchParseTimeMs;
+        private final Path spoolFile;
+
+        ParseBytesOutcome(Metadata primary, String status, long fetchParseTimeMs,
+                          Path spoolFile) {
+            this.primary = primary;
+            this.status = status;
+            this.fetchParseTimeMs = fetchParseTimeMs;
+            this.spoolFile = spoolFile;
+        }
+
+        Metadata primary() {
+            return primary;
+        }
+
+        String status() {
+            return status;
+        }
+
+        long fetchParseTimeMs() {
+            return fetchParseTimeMs;
+        }
+
+        /** Idempotent: {@link #deleteQuietly(Path)} tolerates a missing file. */
+        @Override
+        public void close() {
+            deleteQuietly(spoolFile);
+        }
     }
 }

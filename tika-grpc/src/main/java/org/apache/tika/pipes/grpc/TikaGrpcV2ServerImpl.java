@@ -116,25 +116,20 @@ class TikaGrpcV2ServerImpl extends TikaV2Grpc.TikaV2ImplBase {
             return;
         }
 
-        TikaGrpcServerImpl.ParseBytesOutcome parseBytesOutcome = null;
-        try {
-            parseBytesOutcome = v1.runParseBytes(
-                    request.getContent().toByteArray(),
-                    request.getResourceName(),
-                    request.getParseContextJson());
+        // try-with-resources: the outcome owns the spool file and releases it on every
+        // exit, including the null case (a null resource is simply not closed).
+        try (TikaGrpcServerImpl.ParseBytesOutcome parseBytesOutcome = v1.runParseBytes(
+                request.getContent().toByteArray(),
+                request.getResourceName(),
+                request.getParseContextJson())) {
             if (parseBytesOutcome == null) {
                 return;
             }
-            TikaGrpcServerImpl.FetchParseOutcome outcome = parseBytesOutcome.outcome();
-            String documentId = request.getCorrelationId().isBlank()
-                    ? outcome.fetchKey()
-                    : request.getCorrelationId();
-
             Document.Builder document = DocumentBuilder.build(
-                            outcome.primary(),
-                            documentId,
-                            outcome.status(),
-                            outcome.fetchParseTimeMs())
+                            parseBytesOutcome.primary(),
+                            request.getCorrelationId(),
+                            parseBytesOutcome.status(),
+                            parseBytesOutcome.fetchParseTimeMs())
                     .toBuilder();
 
             SourceOrigin.Builder origin = document.getOriginBuilder();
@@ -161,7 +156,7 @@ class TikaGrpcV2ServerImpl extends TikaV2Grpc.TikaV2ImplBase {
             // consumers can unpack by type URL without growing Document's core fields.
             ParseBytesContext.Builder context = ParseBytesContext.newBuilder()
                     .setTruncated(request.getTruncated());
-            if (!request.getCorrelationId().isBlank()) {
+            if (!request.getCorrelationId().isEmpty()) {
                 context.setCorrelationId(request.getCorrelationId());
             }
             if (!request.getSourceUri().isBlank()) {
@@ -186,7 +181,7 @@ class TikaGrpcV2ServerImpl extends TikaV2Grpc.TikaV2ImplBase {
 
             ParseBytesReply.Builder reply = ParseBytesReply.newBuilder()
                     .setDocument(document);
-            if (!request.getCorrelationId().isBlank()) {
+            if (!request.getCorrelationId().isEmpty()) {
                 reply.setCorrelationId(request.getCorrelationId());
             }
             responseObserver.onNext(reply.build());
@@ -197,10 +192,6 @@ class TikaGrpcV2ServerImpl extends TikaV2Grpc.TikaV2ImplBase {
                     .asRuntimeException());
         } catch (Exception e) {
             throw new RuntimeException(e);
-        } finally {
-            if (parseBytesOutcome != null) {
-                TikaGrpcServerImpl.deleteQuietly(parseBytesOutcome.tempFile());
-            }
         }
     }
 

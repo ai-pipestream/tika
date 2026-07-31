@@ -44,6 +44,7 @@ import com.asarkar.grpc.test.Resources;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.google.common.collect.ImmutableMap;
+import com.google.protobuf.ByteString;
 import io.grpc.ManagedChannel;
 import io.grpc.Server;
 import io.grpc.Status;
@@ -430,6 +431,46 @@ public class TikaGrpcServerTest {
         assertEquals("https://example.com/page.html", context.getSourceUri());
         assertEquals("text/html", context.getDeclaredContentType());
         assertEquals("page.html", context.getResourceName());
+    }
+
+    /**
+     * INV-SPOOL: the internal spool file stays invisible to the caller, and the caller's
+     * resource name reaches detection as metadata rather than as a filename.
+     */
+    @Test
+    public void testParseBytesSpoolStaysInternal(Resources resources) throws Exception {
+        ManagedChannel channel = startChannel(resources, tikaConfig);
+        TikaV2Grpc.TikaV2BlockingStub v2 = TikaV2Grpc.newBlockingStub(channel);
+
+        // Longer than any filesystem allows a name to be, and text/x-java-source has no
+        // magic bytes: only the caller's name can produce that type.
+        String longName = "a".repeat(300) + ".java";
+        ParseBytesReply reply = v2.parseBytes(ParseBytesRequest.newBuilder()
+                .setCorrelationId("spool-1")
+                .setContent(ByteString.copyFromUtf8("class Spool { void f() {} }\n"))
+                .setResourceName(longName)
+                .build());
+
+        Document document = reply.getDocument();
+        assertEquals("PARSE_SUCCESS", document.getStatus().getPipesStatus(),
+                "errors=" + document.getStatus().getErrorsList());
+        assertEquals("text/x-java-source", document.getContentType(),
+                "detection must see the caller's name, not the spool filename");
+        assertEquals(longName, document.getOrigin().getFilename());
+        assertTrue(document.getExtraList().stream().noneMatch(field ->
+                        field.getKey().equals("X-TIKA:sourcePath")),
+                "the internal spool key must not leak into the metadata tail");
+        Assertions.assertFalse(document.getStatus().getParsersUsedList().isEmpty(),
+                "the sanitized copy must preserve reserved X-TIKA keys such as Parsed-By");
+        Assertions.assertFalse(document.toString().contains("parse-bytes-"),
+                "no part of the spool filename may appear in the Document");
+
+        ParseBytesReply anonymous = v2.parseBytes(ParseBytesRequest.newBuilder()
+                .setCorrelationId("spool-2")
+                .setContent(ByteString.copyFromUtf8("<html><body>anonymous</body></html>"))
+                .build());
+        assertEquals("", anonymous.getDocument().getOrigin().getFilename(),
+                "with no resource name supplied, none may be invented from the spool file");
     }
 
     /**
