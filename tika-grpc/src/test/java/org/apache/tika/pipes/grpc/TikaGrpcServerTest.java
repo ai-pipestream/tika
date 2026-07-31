@@ -98,6 +98,10 @@ public class TikaGrpcServerTest {
     // the CRUD/streaming tests, which save fetchers at runtime.
     static Path tikaConfigUnlocked =
             Paths.get("target", "tika-config-unlocked-" + UUID.randomUUID() + ".json");
+    // Digest-enabled variant: a SHA-256 digester in parse-context, for the
+    // observed-digest oracle test.
+    static Path tikaConfigDigest =
+            Paths.get("target", "tika-config-digest-" + UUID.randomUUID() + ".json");
 
 
     @BeforeAll
@@ -134,6 +138,21 @@ public class TikaGrpcServerTest {
         FileUtils.write(tikaConfigUnlocked.toFile(),
                 OBJECT_MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(root),
                 StandardCharsets.UTF_8);
+
+        // Derive a digest-enabled variant: SHA-256 digester as a direct parse-context
+        // component key -- the shape the loader resolves (CommonsDigesterFactory is a
+        // registered component; cf. tika-server's CXFTestBase config).
+        ObjectNode digestRoot = (ObjectNode) OBJECT_MAPPER.readTree(tikaConfig.toFile());
+        ObjectNode parseCtx = digestRoot.has("parse-context")
+                && digestRoot.get("parse-context").isObject()
+                ? (ObjectNode) digestRoot.get("parse-context")
+                : digestRoot.putObject("parse-context");
+        ObjectNode digesterFactory = parseCtx.putObject("commons-digester-factory");
+        digesterFactory.putArray("digests").addObject().put("algorithm", "SHA256");
+        digesterFactory.put("skipContainerDocumentDigest", false);
+        FileUtils.write(tikaConfigDigest.toFile(),
+                OBJECT_MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(digestRoot),
+                StandardCharsets.UTF_8);
     }
 
     @AfterAll
@@ -141,6 +160,7 @@ public class TikaGrpcServerTest {
         try {
             Files.deleteIfExists(tikaConfig);
             Files.deleteIfExists(tikaConfigUnlocked);
+            Files.deleteIfExists(tikaConfigDigest);
         } catch (Exception e) {
             LOG.warn("Failed to delete {}", tikaConfig, e);
         }
@@ -471,6 +491,49 @@ public class TikaGrpcServerTest {
                 .build());
         assertEquals("", anonymous.getDocument().getOrigin().getFilename(),
                 "with no resource name supplied, none may be invented from the spool file");
+    }
+
+    /** origin.sha256 is pipeline-recorded (document.proto): a declared digest is never copied. */
+    @Test
+    public void testParseBytesDeclaredDigestIsNeverCopied(Resources resources) throws Exception {
+        ManagedChannel channel = startChannel(resources, tikaConfig);
+        TikaV2Grpc.TikaV2BlockingStub v2 = TikaV2Grpc.newBlockingStub(channel);
+
+        ParseBytesReply reply = v2.parseBytes(ParseBytesRequest.newBuilder()
+                .setCorrelationId("digest-declared")
+                .setContent(ByteString.copyFromUtf8("<html><body>d</body></html>"))
+                .setDeclaredSha256(
+                        "0000000000000000000000000000000000000000000000000000000000000000")
+                .build());
+
+        assertTrue(reply.getDocument().getOrigin().getSha256().isEmpty(),
+                "origin.sha256 is pipeline-recorded; a caller-declared value is never copied");
+    }
+
+    private static String sha256Hex(byte[] bytes) throws Exception {
+        return java.util.HexFormat.of().formatHex(
+                java.security.MessageDigest.getInstance("SHA-256").digest(bytes));
+    }
+
+    /**
+     * origin.sha256 is the digest the pipeline itself recorded: with a SHA-256 digester
+     * configured it matches an in-test JDK digest of the exact request bytes.
+     */
+    @Test
+    public void testParseBytesObservedDigestMatchesIndependentOracle(Resources resources)
+            throws Exception {
+        ManagedChannel channel = startChannel(resources, tikaConfigDigest);
+        TikaV2Grpc.TikaV2BlockingStub v2 = TikaV2Grpc.newBlockingStub(channel);
+
+        byte[] payload = "<html><body>digest oracle</body></html>"
+                .getBytes(StandardCharsets.UTF_8);
+        ParseBytesReply reply = v2.parseBytes(ParseBytesRequest.newBuilder()
+                .setCorrelationId("digest-oracle")
+                .setContent(ByteString.copyFrom(payload))
+                .build());
+
+        assertEquals(sha256Hex(payload), reply.getDocument().getOrigin().getSha256(),
+                "the pipeline digest must match the in-test JDK digest of the exact request bytes");
     }
 
     /**

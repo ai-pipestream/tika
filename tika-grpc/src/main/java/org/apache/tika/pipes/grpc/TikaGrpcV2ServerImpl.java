@@ -147,9 +147,6 @@ class TikaGrpcV2ServerImpl extends TikaV2Grpc.TikaV2ImplBase {
                 origin.setBaseUri(request.getBaseUri());
             }
             origin.setTruncated(request.getTruncated());
-            if (!request.getDeclaredSha256().isBlank() && origin.getSha256().isBlank()) {
-                origin.setSha256(request.getDeclaredSha256());
-            }
             document.setOrigin(origin);
 
             // Demonstrate the Any extension slot: pack typed ParseBytes provenance so
