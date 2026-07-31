@@ -22,6 +22,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
 import java.io.File;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -38,6 +43,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import com.asarkar.grpc.test.GrpcCleanupExtension;
 import com.asarkar.grpc.test.Resources;
@@ -45,6 +51,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.google.common.collect.ImmutableMap;
 import com.google.protobuf.ByteString;
+import com.sun.net.httpserver.HttpServer;
 import io.grpc.ManagedChannel;
 import io.grpc.Server;
 import io.grpc.Status;
@@ -440,6 +447,71 @@ public class TikaGrpcServerTest {
                 "detected content type, got: " + document.getContentType());
         assertEquals("page.html", document.getOrigin().getFilename());
         assertEquals("https://example.com/page.html", document.getOrigin().getSourceUri());
+    }
+
+    /**
+     * TIKA-4795's central promise: the parse uses the bytes it was given and never
+     * acquires the resource. The provenance URIs point at a local HTTP sentinel that
+     * counts requests <em>before</em> it answers, so a synchronous dereference could not
+     * return from the parse without having been counted -- no post-parse wait is needed.
+     *
+     * <p>Scope of the claim: this observes requests to these URIs, not that nothing
+     * whatsoever was acquired.
+     */
+    @Test
+    public void testParseBytesDoesNotDereferenceProvenanceUris(Resources resources)
+            throws Exception {
+        ManagedChannel channel = startChannel(resources, tikaConfig);
+        TikaV2Grpc.TikaV2BlockingStub v2 = TikaV2Grpc.newBlockingStub(channel);
+
+        AtomicInteger requests = new AtomicInteger();
+        HttpServer sentinel = HttpServer.create(
+                new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 0);
+        sentinel.createContext("/", exchange -> {
+            requests.incrementAndGet();
+            byte[] body = "sentinel".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            try (OutputStream out = exchange.getResponseBody()) {
+                out.write(body);
+            }
+        });
+        sentinel.start();
+        try {
+            // URI builds an IPv6-safe authority (bracketed literal); concatenation would not.
+            String host = sentinel.getAddress().getAddress().getHostAddress();
+            int port = sentinel.getAddress().getPort();
+            URI pageUri = new URI("http", null, host, port, "/page.html", null, null);
+            URI baseUri = new URI("http", null, host, port, "/", null, null);
+
+            // Prove the sentinel counts, so a zero below cannot pass on a broken mechanism.
+            try (InputStream probe = pageUri.toURL().openStream()) {
+                assertNotNull(probe.readAllBytes());
+            }
+            assertEquals(1, requests.get(), "the sentinel must count a real request");
+            requests.set(0);
+
+            // A relative link plus a base URI gives link resolution a reason to fetch.
+            ParseBytesReply reply = v2.parseBytes(ParseBytesRequest.newBuilder()
+                    .setCorrelationId("no-deref-1")
+                    .setContent(ByteString.copyFromUtf8(
+                            "<html><head><title>Bytes</title></head><body>"
+                                    + "<a href=\"linked.html\">link</a> Hello from raw bytes."
+                                    + "</body></html>"))
+                    .setResourceName("page.html")
+                    .setSourceUri(pageUri.toString())
+                    .setEffectiveUri(pageUri.toString())
+                    .setBaseUri(baseUri.toString())
+                    .build());
+
+            assertEquals("PARSE_SUCCESS", reply.getDocument().getStatus().getPipesStatus(),
+                    "errors=" + reply.getDocument().getStatus().getErrorsList());
+            assertEquals("Bytes", reply.getDocument().getMetadata().getTitle(),
+                    "the parsed content must come from the supplied payload");
+            assertEquals(0, requests.get(),
+                    "ParseBytes must not dereference the caller's provenance URIs");
+        } finally {
+            sentinel.stop(0);
+        }
     }
 
     /**
