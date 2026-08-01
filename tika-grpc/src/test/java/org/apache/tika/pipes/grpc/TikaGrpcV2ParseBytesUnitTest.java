@@ -169,6 +169,51 @@ class TikaGrpcV2ParseBytesUnitTest {
                 "the interrupt comes from the server going down, so the client may retry");
     }
 
+    /**
+     * INV-BOUND-REJECTED-ONCE (a): the cap is checked where the declared size arrives,
+     * so it costs nothing to exercise. A four-byte stream with a size declared past the
+     * bound reaches the check without allocating 64 MiB anywhere.
+     */
+    @Test
+    void contentAboveTheBoundIsRejectedBeforeAnythingIsAllocated(@TempDir Path tmp)
+            throws Exception {
+        TikaGrpcServerImpl real = realImpl(tmp);
+        try {
+            assertThrows(TikaGrpcServerImpl.ParseBytesTooLargeException.class, () ->
+                    real.runParseBytes(bytes("<x/>"),
+                            TikaGrpcServerImpl.PARSE_BYTES_MAX_BYTES + 1L, "a.html", null));
+
+            try (var files = Files.list(real.parseBytesDir)) {
+                assertTrue(files.findAny().isEmpty(),
+                        "a rejected request must not have created a spool file");
+            }
+        } finally {
+            real.postShutdown();
+        }
+    }
+
+    /**
+     * INV-BOUND-REJECTED-ONCE (b): oversize maps to RESOURCE_EXHAUSTED, not
+     * INVALID_ARGUMENT. The request is well formed; the server declines to accept that
+     * much, which is a different answer from "your argument is wrong".
+     */
+    @Test
+    void oversizeIsReportedAsResourceExhausted() throws Exception {
+        Mockito.when(v1.runParseBytes(Mockito.any(), Mockito.anyLong(), Mockito.any(),
+                        Mockito.any()))
+                .thenThrow(new TikaGrpcServerImpl.ParseBytesTooLargeException(
+                        "content exceeds ParseBytes bound of 1 bytes"));
+        RecordingObserver observer = new RecordingObserver();
+
+        v2.parseBytes(requestWithContent().build(), observer);
+
+        assertTrue(observer.replies.isEmpty(), "no reply may accompany a refusal");
+        assertEquals(1, observer.errors.size(), "exactly one terminal signal");
+        assertEquals(Status.Code.RESOURCE_EXHAUSTED,
+                Status.fromThrowable(observer.errors.get(0)).getCode(),
+                "oversize is a resource decision, not a malformed argument");
+    }
+
     /** The spool file is released once the reply has been produced. */
     @Test
     void spoolFileIsReleasedAfterReply() throws Exception {

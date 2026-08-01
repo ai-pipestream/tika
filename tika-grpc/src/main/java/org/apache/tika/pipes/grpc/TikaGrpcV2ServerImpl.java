@@ -102,13 +102,6 @@ class TikaGrpcV2ServerImpl extends TikaV2Grpc.TikaV2ImplBase {
                     .asRuntimeException());
             return;
         }
-        if (request.getContent().size() > TikaGrpcServerImpl.PARSE_BYTES_MAX_BYTES) {
-            responseObserver.onError(io.grpc.Status.RESOURCE_EXHAUSTED
-                    .withDescription("content exceeds ParseBytes bound of "
-                            + TikaGrpcServerImpl.PARSE_BYTES_MAX_BYTES + " bytes")
-                    .asRuntimeException());
-            return;
-        }
         if (v1.denyPerRequestConfig(null, request.getParseContextJson(), responseObserver)) {
             return;
         }
@@ -162,6 +155,12 @@ class TikaGrpcV2ServerImpl extends TikaV2Grpc.TikaV2ImplBase {
             }
             responseObserver.onNext(reply.build());
             responseObserver.onCompleted();
+        } catch (TikaGrpcServerImpl.ParseBytesTooLargeException e) {
+            // A well-formed request the server declines to accept, which is a different
+            // answer from INVALID_ARGUMENT below.
+            responseObserver.onError(io.grpc.Status.RESOURCE_EXHAUSTED
+                    .withDescription(e.getMessage())
+                    .asRuntimeException());
         } catch (IllegalArgumentException e) {
             responseObserver.onError(io.grpc.Status.INVALID_ARGUMENT
                     .withDescription(e.getMessage())

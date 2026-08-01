@@ -822,8 +822,10 @@ class TikaGrpcServerImpl extends TikaGrpc.TikaImplBase {
         if (content == null || size <= 0) {
             throw new IllegalArgumentException("content is required");
         }
+        // The single place the bound is enforced. The transport has its own, larger
+        // envelope limit; the two are never combined into a third number.
         if (size > PARSE_BYTES_MAX_BYTES) {
-            throw new IllegalArgumentException(
+            throw new ParseBytesTooLargeException(
                     "content exceeds ParseBytes bound of " + PARSE_BYTES_MAX_BYTES + " bytes");
         }
         // createTempFile creates the file up front, so every path out of here that does
@@ -935,6 +937,20 @@ class TikaGrpcServerImpl extends TikaGrpc.TikaImplBase {
         Files.writeString(augmented,
                 OBJECT_MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(root));
         return augmented;
+    }
+
+    /**
+     * Raised when declared content exceeds {@link #PARSE_BYTES_MAX_BYTES}. Extends
+     * {@link RuntimeException} directly rather than {@link IllegalArgumentException}:
+     * oversize content is a well-formed request the server declines to accept, which is
+     * what {@code RESOURCE_EXHAUSTED} exists for, and a disjoint type means dropping the
+     * mapping surfaces as {@code UNKNOWN} instead of quietly answering
+     * {@code INVALID_ARGUMENT}.
+     */
+    static final class ParseBytesTooLargeException extends RuntimeException {
+        ParseBytesTooLargeException(String message) {
+            super(message);
+        }
     }
 
     /**
