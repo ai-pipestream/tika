@@ -115,8 +115,11 @@ class TikaGrpcV2ServerImpl extends TikaV2Grpc.TikaV2ImplBase {
 
         // try-with-resources: the outcome owns the spool file and releases it on every
         // exit, including the null case (a null resource is simply not closed).
+        // newInput() is a view over the bytes protobuf already holds; toByteArray() would
+        // copy the whole payload a second time before it ever reaches the spool.
         try (TikaGrpcServerImpl.ParseBytesOutcome parseBytesOutcome = v1.runParseBytes(
-                request.getContent().toByteArray(),
+                request.getContent().newInput(),
+                request.getContent().size(),
                 request.getResourceName(),
                 request.getParseContextJson())) {
             if (parseBytesOutcome == null) {

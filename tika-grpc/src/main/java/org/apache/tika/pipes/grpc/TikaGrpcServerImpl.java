@@ -18,8 +18,10 @@ package org.apache.tika.pipes.grpc;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -804,24 +806,33 @@ class TikaGrpcServerImpl extends TikaGrpc.TikaImplBase {
      * as metadata instead, which the pipes worker preserves across its fresh-metadata
      * boundary. Caller names therefore never have to satisfy filesystem constraints.
      *
+     * <p>Content arrives as a stream so that it reaches the spool without a second copy
+     * in heap: the transport hands over a view of the bytes it already holds, and this
+     * method -- which owns the spool file's whole lifecycle -- is the only place that
+     * touches the filesystem. {@code size} comes alongside because a stream cannot report
+     * one, and the bound has to be enforced before the copy starts.
+     *
+     * @param content the bytes to parse; consumed but not closed by this method
+     * @param size    the number of bytes {@code content} will yield
      * @return the outcome owning the spool file, or {@code null} if the calling thread
      *         was interrupted before a reply could be built
      */
-    ParseBytesOutcome runParseBytes(byte[] content, String resourceNameHint,
+    ParseBytesOutcome runParseBytes(InputStream content, long size, String resourceNameHint,
                                     String parseContextJson) throws IOException {
-        if (content == null || content.length == 0) {
+        if (content == null || size <= 0) {
             throw new IllegalArgumentException("content is required");
         }
-        if (content.length > PARSE_BYTES_MAX_BYTES) {
+        if (size > PARSE_BYTES_MAX_BYTES) {
             throw new IllegalArgumentException(
                     "content exceeds ParseBytes bound of " + PARSE_BYTES_MAX_BYTES + " bytes");
         }
         // createTempFile creates the file up front, so every path out of here that does
-        // not hand it to the caller has to delete it -- a failed write included.
+        // not hand it to the caller has to delete it -- a failed write included. It also
+        // means the copy has to replace what createTempFile just made.
         Path file = Files.createTempFile(parseBytesDir, "parse-bytes-", "");
         boolean transferred = false;
         try {
-            Files.write(file, content);
+            Files.copy(content, file, StandardCopyOption.REPLACE_EXISTING);
             Metadata tikaMetadata = new Metadata();
             if (resourceNameHint != null && !resourceNameHint.isBlank()) {
                 tikaMetadata.set(TikaCoreProperties.RESOURCE_NAME_KEY, resourceNameHint.trim());

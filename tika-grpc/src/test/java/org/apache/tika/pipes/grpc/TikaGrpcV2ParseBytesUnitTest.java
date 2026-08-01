@@ -22,6 +22,8 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.ByteArrayInputStream;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -97,6 +99,11 @@ class TikaGrpcV2ParseBytesUnitTest {
                 htmlMetadata(), "PARSE_SUCCESS", 5L, spool);
     }
 
+    /** runParseBytes consumes a stream, so the fixtures hand it one. */
+    private static InputStream bytes(String content) {
+        return new ByteArrayInputStream(content.getBytes(StandardCharsets.UTF_8));
+    }
+
     private static ParseBytesRequest.Builder requestWithContent() {
         return ParseBytesRequest.newBuilder()
                 .setContent(ByteString.copyFromUtf8("<html><body>u</body></html>"));
@@ -109,7 +116,7 @@ class TikaGrpcV2ParseBytesUnitTest {
      */
     @Test
     void noReplyFieldIsDerivedFromTheSpoolName() throws Exception {
-        Mockito.when(v1.runParseBytes(Mockito.any(), Mockito.any(), Mockito.any()))
+        Mockito.when(v1.runParseBytes(Mockito.any(), Mockito.anyLong(), Mockito.any(), Mockito.any()))
                 .thenReturn(outcome());
         RecordingObserver observer = new RecordingObserver();
 
@@ -123,7 +130,7 @@ class TikaGrpcV2ParseBytesUnitTest {
     /** An opaque id echoes verbatim: whitespace is a value, not absence. */
     @Test
     void whitespaceCorrelationEchoesVerbatim() throws Exception {
-        Mockito.when(v1.runParseBytes(Mockito.any(), Mockito.any(), Mockito.any()))
+        Mockito.when(v1.runParseBytes(Mockito.any(), Mockito.anyLong(), Mockito.any(), Mockito.any()))
                 .thenReturn(outcome());
         RecordingObserver observer = new RecordingObserver();
 
@@ -145,7 +152,7 @@ class TikaGrpcV2ParseBytesUnitTest {
      */
     @Test
     void interruptedRoundTripStillTerminatesTheRpc() throws Exception {
-        Mockito.when(v1.runParseBytes(Mockito.any(), Mockito.any(), Mockito.any()))
+        Mockito.when(v1.runParseBytes(Mockito.any(), Mockito.anyLong(), Mockito.any(), Mockito.any()))
                 .thenReturn(null);
         RecordingObserver observer = new RecordingObserver();
 
@@ -166,7 +173,7 @@ class TikaGrpcV2ParseBytesUnitTest {
     @Test
     void spoolFileIsReleasedAfterReply() throws Exception {
         Path spool = Files.createTempFile(spoolDir, "parse-bytes-", "");
-        Mockito.when(v1.runParseBytes(Mockito.any(), Mockito.any(), Mockito.any()))
+        Mockito.when(v1.runParseBytes(Mockito.any(), Mockito.anyLong(), Mockito.any(), Mockito.any()))
                 .thenReturn(new TikaGrpcServerImpl.ParseBytesOutcome(
                         htmlMetadata(), "PARSE_SUCCESS", 5L, spool));
         RecordingObserver observer = new RecordingObserver();
@@ -205,7 +212,7 @@ class TikaGrpcV2ParseBytesUnitTest {
                             Mockito.isNull(), Mockito.any(), Mockito.any(Metadata.class));
 
             assertThrows(RuntimeException.class, () ->
-                    spied.runParseBytes("<x/>".getBytes(StandardCharsets.UTF_8), "a.html", null));
+                    spied.runParseBytes(bytes("<x/>"), 4, "a.html", null));
 
             try (var files = Files.list(spied.parseBytesDir)) {
                 assertTrue(files.findAny().isEmpty(),
@@ -228,8 +235,7 @@ class TikaGrpcV2ParseBytesUnitTest {
                     .when(spied).runFetchAndParse(Mockito.anyString(), Mockito.anyString(),
                             Mockito.isNull(), Mockito.any(), Mockito.any(Metadata.class));
 
-            assertNull(spied.runParseBytes(
-                    "<x/>".getBytes(StandardCharsets.UTF_8), "a.html", null));
+            assertNull(spied.runParseBytes(bytes("<x/>"), 4, "a.html", null));
 
             try (var files = Files.list(spied.parseBytesDir)) {
                 assertTrue(files.findAny().isEmpty(),
