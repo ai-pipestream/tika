@@ -42,6 +42,8 @@ public class TikaGrpcConfig {
 
     private boolean allowComponentManagement = false;
 
+    private Integer maxInboundMessageBytes = null;
+
     /**
      * Loads {@link TikaGrpcConfig} from the {@code "grpc"} section of the JSON
      * configuration, or returns a locked-down default instance (all flags
@@ -102,5 +104,41 @@ public class TikaGrpcConfig {
 
     public void setAllowComponentManagement(boolean allowComponentManagement) {
         this.allowComponentManagement = allowComponentManagement;
+    }
+
+    /**
+     * The largest request the server will accept, in bytes, applied as gRPC's
+     * {@code maxInboundMessageSize}. {@code null} means the key is absent and gRPC's own
+     * default (roughly 4 MiB) governs, which is what an unconfigured server ships with.
+     * <p>
+     * The type is boxed on purpose: "not configured" is a distinct state from any value,
+     * and the server must leave the builder untouched rather than reassert a default of
+     * its own.
+     * <p>
+     * This is server-global. Raising it raises what <em>every</em> RPC will accept,
+     * including the management calls that only ever carry small JSON, and a unary message
+     * is materialised in full in heap before the handler runs, so this also bounds the
+     * heap one <em>request</em> can demand. It is not an aggregate budget: concurrent
+     * requests each get this much, and nothing here caps how many are in flight. It is
+     * also unrelated to the ParseBytes content cap, which bounds only {@code content} and
+     * is enforced separately; the two are never combined into a third number.
+     *
+     * @return the configured inbound limit in bytes, or {@code null} if unset
+     */
+    public Integer getMaxInboundMessageBytes() {
+        return maxInboundMessageBytes;
+    }
+
+    /**
+     * @param maxInboundMessageBytes positive limit in bytes, or {@code null} to defer to
+     *                               gRPC's default
+     * @throws IllegalArgumentException if the value is present and not positive
+     */
+    public void setMaxInboundMessageBytes(Integer maxInboundMessageBytes) {
+        if (maxInboundMessageBytes != null && maxInboundMessageBytes <= 0) {
+            throw new IllegalArgumentException(
+                    "maxInboundMessageBytes must be positive, got: " + maxInboundMessageBytes);
+        }
+        this.maxInboundMessageBytes = maxInboundMessageBytes;
     }
 }
