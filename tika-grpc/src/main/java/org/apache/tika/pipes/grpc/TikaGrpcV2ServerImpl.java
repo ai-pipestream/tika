@@ -120,6 +120,12 @@ class TikaGrpcV2ServerImpl extends TikaV2Grpc.TikaV2ImplBase {
                 request.getResourceName(),
                 request.getParseContextJson())) {
             if (parseBytesOutcome == null) {
+                // Interrupted before a reply could be built. There is no pipes result, so
+                // there is no status a Document could honestly carry -- but the call still
+                // has to be closed, or it stays open until the client's deadline.
+                responseObserver.onError(io.grpc.Status.UNAVAILABLE
+                        .withDescription("parse was interrupted before a reply could be built")
+                        .asRuntimeException());
                 return;
             }
             Document.Builder document = DocumentBuilder.build(

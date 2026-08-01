@@ -32,6 +32,7 @@ import java.util.List;
 import java.util.Map;
 
 import com.google.protobuf.ByteString;
+import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -133,6 +134,32 @@ class TikaGrpcV2ParseBytesUnitTest {
                 "the reply echoes the opaque id verbatim");
         assertEquals("  ", observer.replies.get(0).getDocument().getId(),
                 "Document.id carries the same verbatim id");
+    }
+
+    /**
+     * INV-TERMINAL: an interrupted round trip still closes the RPC. runParseBytes returns
+     * null when the calling thread was interrupted before a reply could be built; with no
+     * terminal signal the call stays open until the client's deadline, or forever if the
+     * client set none. No Document is invented either: without a pipes result there is no
+     * status the server could honestly report.
+     */
+    @Test
+    void interruptedRoundTripStillTerminatesTheRpc() throws Exception {
+        Mockito.when(v1.runParseBytes(Mockito.any(), Mockito.any(), Mockito.any()))
+                .thenReturn(null);
+        RecordingObserver observer = new RecordingObserver();
+
+        v2.parseBytes(requestWithContent().build(), observer);
+
+        assertTrue(observer.replies.isEmpty(),
+                "no Document may be invented without a pipes result");
+        assertEquals(0, observer.completions,
+                "an interrupted round trip is not a successful completion");
+        assertEquals(1, observer.errors.size(),
+                "exactly one terminal signal must close the call");
+        assertEquals(Status.Code.UNAVAILABLE,
+                Status.fromThrowable(observer.errors.get(0)).getCode(),
+                "the interrupt comes from the server going down, so the client may retry");
     }
 
     /** The spool file is released once the reply has been produced. */
