@@ -19,6 +19,33 @@ requests through the configured fetchers.
 > the config. See the
 > [Tika gRPC security configuration docs](../docs/modules/ROOT/pages/using-tika/grpc/index.adoc).
 
+### Message size
+
+By default the server does not set gRPC's inbound message limit, so gRPC's own
+default of roughly 4 MiB applies. Raise it with `maxInboundMessageBytes` in the
+`grpc` section:
+
+```json
+{
+  "grpc": {
+    "maxInboundMessageBytes": 104857600
+  }
+}
+```
+
+This is server-global. It raises what *every* RPC will accept, including the
+management calls that only ever carry small JSON. A unary message is held in
+full in memory before the handler runs, so the value also bounds the heap one
+request can demand — but not in aggregate: concurrent requests each get this
+much, and nothing here limits how many are in flight.
+
+ParseBytes bounds its `content` field separately, at 64 MiB. The two numbers are
+independent and are never combined: the transport measures the whole request,
+`content` is only part of it. If the inbound limit is at or below 64 MiB the
+server says so at startup, because the ParseBytes bound then never comes into
+play — the transport refuses first. `dev-tika-config.json` sets 100 MiB so the
+ParseBytes surface is usable in development.
+
 ## v1 and v2 parse surfaces
 
 The server exposes two gRPC services on the same port:
