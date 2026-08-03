@@ -283,6 +283,38 @@ public class TikaGrpcBoundTest {
     }
 
     /**
+     * A transport limit the heap cannot absorb is announced. Suggested by Kristian
+     * Rickert on TIKA-4795: a unary request is held in memory in full before parsing
+     * starts, so an inbound limit close to the heap size is a configuration that will
+     * fail under load rather than at startup.
+     */
+    @Test
+    public void aTransportLimitTooLargeForTheHeapIsAnnounced() {
+        long mib = 1024L * 1024L;
+        assertNotNull(TikaGrpcServer.heapHeadroomWarning(100 * (int) mib, 256 * mib),
+                "100 MiB inbound on a 256 MiB heap leaves no room for one request");
+        assertNull(TikaGrpcServer.heapHeadroomWarning(100 * (int) mib, 1024 * mib),
+                "a gigabyte of heap absorbs a 100 MiB request");
+        assertNull(TikaGrpcServer.heapHeadroomWarning(100 * (int) mib, 300 * mib),
+                "exactly the headroom floor is not a warning");
+        assertNull(TikaGrpcServer.heapHeadroomWarning(null, 64 * mib),
+                "no knob means grpc's own small default, nothing to say");
+        assertNull(TikaGrpcServer.heapHeadroomWarning(100 * (int) mib, Long.MAX_VALUE),
+                "an unbounded heap cannot be too small");
+    }
+
+    /** Both startup warnings reach the caller through one place, so one loop logs them. */
+    @Test
+    public void bothWarningsAreCollectedTogether() {
+        long mib = 1024L * 1024L;
+        assertEquals(2, TikaGrpcServer.startupWarnings(
+                        TikaGrpcServerImpl.PARSE_BYTES_MAX_BYTES, 100 * mib).size(),
+                "a limit at the cap on a small heap is two separate problems");
+        assertTrue(TikaGrpcServer.startupWarnings(DEMO_LIMIT, 8192 * mib).isEmpty(),
+                "the demo limit on a healthy heap has nothing to report");
+    }
+
+    /**
      * The warning is emitted, not merely computed. Asserting only that
      * {@link TikaGrpcServer#inertCapWarning} builds a string would leave the same hole the
      * knob wiring had: deleting the {@code LOGGER.warn(...)} call would still pass.

@@ -24,6 +24,8 @@ import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 import com.beust.jcommander.JCommander;
@@ -113,9 +115,10 @@ public class TikaGrpcServer {
         serviceImpl = new TikaGrpcServerImpl(tikaConfigFile.getAbsolutePath(), pluginRoots);
         ServerBuilder<?> serverBuilder = Grpc.newServerBuilderForPort(port, creds);
         applyInboundLimit(serverBuilder, serviceImpl.tikaGrpcConfig);
-        String inertCap = inertCapWarning(serviceImpl.tikaGrpcConfig.getMaxInboundMessageBytes());
-        if (inertCap != null) {
-            LOGGER.warn(inertCap);
+        for (String warning : startupWarnings(
+                serviceImpl.tikaGrpcConfig.getMaxInboundMessageBytes(),
+                Runtime.getRuntime().maxMemory())) {
+            LOGGER.warn(warning);
         }
         // v1 (tika.Tika) stays the stable fields-map contract; v2 (TikaV2) is the
         // experimental typed Document surface. Both share the same pipes runtime.
@@ -247,6 +250,64 @@ public class TikaGrpcServer {
                 + " bytes, but this server's maxInboundMessageBytes is "
                 + maxInboundMessageBytes + ". The request also has to carry its other "
                 + "fields, so the transport refuses before the ParseBytes bound applies.";
+    }
+
+    /**
+     * How much heap one in-flight request of the configured size wants, as a multiple of
+     * that size. A unary request is assembled into a byte array and then handed to
+     * protobuf, on top of the transport's own buffers, so two is the bare minimum and
+     * three leaves a little room. It is a floor for a <em>single</em> request; concurrent
+     * requests multiply it and nothing here caps how many there are.
+     */
+    private static final int HEAP_HEADROOM_MULTIPLE = 3;
+
+    /**
+     * The warnings worth emitting at startup about the configured message limit, in the
+     * order they should be logged, or an empty list when there is nothing to report.
+     *
+     * <p>One place so there is one loop to log them. The conditions and wording of each
+     * warning are unit-tested here as pure functions; that the loop actually reaches the
+     * log is covered once, by the real-server test.
+     */
+    static List<String> startupWarnings(Integer maxInboundMessageBytes, long maxHeapBytes) {
+        List<String> warnings = new ArrayList<>(2);
+        String inertCap = inertCapWarning(maxInboundMessageBytes);
+        if (inertCap != null) {
+            warnings.add(inertCap);
+        }
+        String heapHeadroom = heapHeadroomWarning(maxInboundMessageBytes, maxHeapBytes);
+        if (heapHeadroom != null) {
+            warnings.add(heapHeadroom);
+        }
+        return warnings;
+    }
+
+    /**
+     * The warning an operator needs when the configured message limit is large relative to
+     * the heap this JVM may use, or {@code null} when there is nothing to say.
+     *
+     * <p>The heap is a parameter rather than read here so the condition can be tested with
+     * explicit values instead of depending on the {@code -Xmx} the test JVM happens to run
+     * with.
+     *
+     * <p>This is the gRPC server's own heap, which is the one that matters: a unary
+     * request is materialised here in full before any handler runs. The forked pipes
+     * worker is a separate process with its own heap, and for ParseBytes it reads the
+     * document from the spool file rather than receiving it in a message.
+     */
+    static String heapHeadroomWarning(Integer maxInboundMessageBytes, long maxHeapBytes) {
+        if (maxInboundMessageBytes == null || maxHeapBytes == Long.MAX_VALUE) {
+            return null;
+        }
+        long wanted = (long) maxInboundMessageBytes * HEAP_HEADROOM_MULTIPLE;
+        if (maxHeapBytes >= wanted) {
+            return null;
+        }
+        return "maxInboundMessageBytes is " + maxInboundMessageBytes + " but this JVM's "
+                + "maximum heap is " + maxHeapBytes + ". A request is held in memory in "
+                + "full before parsing starts, so one of that size wants around "
+                + wanted + " bytes, and concurrent requests want that much each. Either "
+                + "raise the heap or lower the limit.";
     }
 
     public TikaGrpcServer setTikaConfig(File tikaConfig) {
