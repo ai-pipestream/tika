@@ -22,10 +22,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
 import java.io.File;
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetAddress;
-import java.net.InetSocketAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -51,7 +53,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.google.common.collect.ImmutableMap;
 import com.google.protobuf.ByteString;
-import com.sun.net.httpserver.HttpServer;
 import io.grpc.ManagedChannel;
 import io.grpc.Server;
 import io.grpc.Status;
@@ -464,22 +465,37 @@ public class TikaGrpcServerTest {
         ManagedChannel channel = startChannel(resources, tikaConfig);
         TikaV2Grpc.TikaV2BlockingStub v2 = TikaV2Grpc.newBlockingStub(channel);
 
+        // Plain ServerSocket: forbiddenapis rejects com.sun.net.httpserver as non-portable.
         AtomicInteger requests = new AtomicInteger();
-        HttpServer sentinel = HttpServer.create(
-                new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 0);
-        sentinel.createContext("/", exchange -> {
-            requests.incrementAndGet();
+        ServerSocket sentinel = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
+        Thread acceptor = new Thread(() -> {
             byte[] body = "sentinel".getBytes(StandardCharsets.UTF_8);
-            exchange.sendResponseHeaders(200, body.length);
-            try (OutputStream out = exchange.getResponseBody()) {
-                out.write(body);
+            byte[] head = ("HTTP/1.1 200 OK\r\nContent-Length: " + body.length
+                    + "\r\nConnection: close\r\n\r\n").getBytes(StandardCharsets.UTF_8);
+            while (true) {
+                try (Socket socket = sentinel.accept()) {
+                    // Count BEFORE answering: a synchronous dereference cannot return
+                    // from the parse without having been counted.
+                    requests.incrementAndGet();
+                    // Wait for the request to start before replying, then answer.
+                    if (socket.getInputStream().read() == -1) {
+                        continue;
+                    }
+                    OutputStream out = socket.getOutputStream();
+                    out.write(head);
+                    out.write(body);
+                    out.flush();
+                } catch (IOException e) {
+                    return; // sentinel closed
+                }
             }
-        });
-        sentinel.start();
+        }, "no-deref-sentinel");
+        acceptor.setDaemon(true);
+        acceptor.start();
         try {
             // URI builds an IPv6-safe authority (bracketed literal); concatenation would not.
-            String host = sentinel.getAddress().getAddress().getHostAddress();
-            int port = sentinel.getAddress().getPort();
+            String host = sentinel.getInetAddress().getHostAddress();
+            int port = sentinel.getLocalPort();
             URI pageUri = new URI("http", null, host, port, "/page.html", null, null);
             URI baseUri = new URI("http", null, host, port, "/", null, null);
 
@@ -490,7 +506,8 @@ public class TikaGrpcServerTest {
             assertEquals(1, requests.get(), "the sentinel must count a real request");
             requests.set(0);
 
-            // A relative link plus a base URI gives link resolution a reason to fetch.
+            // A relative link plus a base URI gives any accidental dereference a valid
+            // local target.
             ParseBytesReply reply = v2.parseBytes(ParseBytesRequest.newBuilder()
                     .setCorrelationId("no-deref-1")
                     .setContent(ByteString.copyFromUtf8(
@@ -510,7 +527,7 @@ public class TikaGrpcServerTest {
             assertEquals(0, requests.get(),
                     "ParseBytes must not dereference the caller's provenance URIs");
         } finally {
-            sentinel.stop(0);
+            sentinel.close();
         }
     }
 
