@@ -862,13 +862,14 @@ class TikaGrpcServerImpl extends TikaGrpc.TikaImplBase {
 
     /**
      * Copies the parse metadata without the two traces the spool file leaves in it: the
-     * fetcher records the fetch key as {@code X-TIKA:sourcePath}, and Tika falls back to
-     * the spool filename as the resource name when the caller supplied none. The copy is
-     * owned by the outcome, so nothing downstream shares state with the pipes result.
+     * fetcher records the fetch key under {@link TikaCoreProperties#SOURCE_PATH}, and
+     * Tika falls back to the spool filename as the resource name when the caller
+     * supplied none. The copy is owned by the outcome, so nothing downstream shares
+     * state with the pipes result.
      *
      * <p>The copy is written as a trusted transformation target, which is what
-     * {@link Metadata#setTrusted(boolean)} exists for: plain writes drop reserved
-     * {@code X-TIKA:} keys such as {@code X-TIKA:Parsed-By} and the observed digest.
+     * {@link Metadata#addTrusted(String, String)} exists for: plain writes drop reserved
+     * Tika metadata keys such as the parsed-by chain and the observed digest.
      *
      * @return {@code null} when {@code source} is null, since that is how the mapper
      *         distinguishes "pipes returned no metadata" from an empty document
@@ -884,19 +885,14 @@ class TikaGrpcServerImpl extends TikaGrpc.TikaImplBase {
         boolean dropResourceName = resourceNameHint == null || resourceNameHint.isBlank();
         String sourcePathKey = TikaCoreProperties.SOURCE_PATH.getName();
         String resourceNameKey = TikaCoreProperties.RESOURCE_NAME_KEY.getName();
-        copy.setTrusted(true);
-        try {
-            for (String name : source.names()) {
-                if (name.equals(sourcePathKey)
-                        || (dropResourceName && name.equals(resourceNameKey))) {
-                    continue;
-                }
-                for (String value : source.getValues(name)) {
-                    copy.add(name, value);
-                }
+        for (String name : source.names()) {
+            if (name.equals(sourcePathKey)
+                    || (dropResourceName && name.equals(resourceNameKey))) {
+                continue;
             }
-        } finally {
-            copy.setTrusted(false);
+            for (String value : source.getValues(name)) {
+                copy.addTrusted(name, value);
+            }
         }
         return copy;
     }
