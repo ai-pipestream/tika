@@ -33,6 +33,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.google.protobuf.ByteString;
 import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
@@ -181,7 +183,31 @@ class TikaGrpcV2ParseBytesUnitTest {
         try {
             assertThrows(TikaGrpcServerImpl.ParseBytesTooLargeException.class, () ->
                     real.runParseBytes(bytes("<x/>"),
-                            TikaGrpcServerImpl.PARSE_BYTES_MAX_BYTES + 1L, "a.html", null));
+                            TikaGrpcConfig.DEFAULT_PARSE_BYTES_MAX_CONTENT_BYTES + 1L,
+                            "a.html", null));
+
+            try (var files = Files.list(real.parseBytesDir)) {
+                assertTrue(files.findAny().isEmpty(),
+                        "a rejected request must not have created a spool file");
+            }
+        } finally {
+            real.postShutdown();
+        }
+    }
+
+    /**
+     * The content cap is configuration, not a constant: a configured
+     * {@code parseBytesMaxContentBytes} governs the check in place of the 64 MiB
+     * default. A tiny configured cap rejects a declared size the default would accept,
+     * still without allocating or spooling anything.
+     */
+    @Test
+    void theContentCapComesFromTheConfig(@TempDir Path tmp) throws Exception {
+        TikaGrpcServerImpl real = realImpl(tmp, 1024L);
+        try {
+            assertThrows(TikaGrpcServerImpl.ParseBytesTooLargeException.class, () ->
+                    real.runParseBytes(bytes("<x/>"), 1025L, "a.html", null),
+                    "content above the configured cap must be refused");
 
             try (var files = Files.list(real.parseBytesDir)) {
                 assertTrue(files.findAny().isEmpty(),
@@ -236,6 +262,11 @@ class TikaGrpcV2ParseBytesUnitTest {
     // ------------------------------------------------------------------
 
     private static TikaGrpcServerImpl realImpl(Path tmp) throws Exception {
+        return realImpl(tmp, null);
+    }
+
+    private static TikaGrpcServerImpl realImpl(Path tmp, Long parseBytesMaxContentBytes)
+            throws Exception {
         Path config = tmp.resolve("unit-config.json");
         Map<String, Object> replacements = new HashMap<>();
         replacements.put("JAVA_PATH", Paths.get(System.getProperty("java.home"), "bin", "java"));
@@ -243,6 +274,16 @@ class TikaGrpcV2ParseBytesUnitTest {
         replacements.put("PLUGIN_ROOTS", Paths.get("target").toAbsolutePath().resolve("plugins"));
         JsonConfigHelper.writeConfigFromResource("/tika-pipes-test-config.json",
                 TikaGrpcServerTest.class, replacements, config);
+        if (parseBytesMaxContentBytes != null) {
+            ObjectMapper mapper = new ObjectMapper();
+            ObjectNode root = (ObjectNode) mapper.readTree(config.toFile());
+            ObjectNode grpc = root.has("grpc") && root.get("grpc").isObject()
+                    ? (ObjectNode) root.get("grpc")
+                    : root.putObject("grpc");
+            grpc.put("parseBytesMaxContentBytes", parseBytesMaxContentBytes);
+            Files.writeString(config,
+                    mapper.writerWithDefaultPrettyPrinter().writeValueAsString(root));
+        }
         return new TikaGrpcServerImpl(config.toAbsolutePath().toString());
     }
 

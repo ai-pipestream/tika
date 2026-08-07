@@ -28,7 +28,8 @@ default of roughly 4 MiB applies. Raise it with `maxInboundMessageBytes` in the
 ```json
 {
   "grpc": {
-    "maxInboundMessageBytes": 104857600
+    "maxInboundMessageBytes": 104857600,
+    "parseBytesMaxContentBytes": 33554432
   }
 }
 ```
@@ -39,12 +40,14 @@ full in memory before the handler runs, so the value also bounds the heap one
 request can demand — but not in aggregate: concurrent requests each get this
 much, and nothing here limits how many are in flight.
 
-ParseBytes bounds its `content` field separately, at 64 MiB. The two numbers are
-independent and are never combined: the transport measures the whole request,
-`content` is only part of it. If the inbound limit is at or below 64 MiB the
-server says so at startup, because the ParseBytes bound then never comes into
-play — the transport refuses first. `dev-tika-config.json` sets 100 MiB so the
-ParseBytes surface is usable in development.
+ParseBytes bounds its `content` field separately, at 64 MiB by default. Change
+that with `parseBytesMaxContentBytes` in the same `grpc` section (bytes, must
+be positive). The two numbers are independent and are never combined: the
+transport measures the whole request, `content` is only part of it. If the
+inbound limit is at or below the content cap the server says so at startup,
+because the cap then never comes into play — the transport refuses first.
+`dev-tika-config.json` sets a 100 MiB inbound limit so the ParseBytes surface
+is usable in development.
 
 ## v1 and v2 parse surfaces
 

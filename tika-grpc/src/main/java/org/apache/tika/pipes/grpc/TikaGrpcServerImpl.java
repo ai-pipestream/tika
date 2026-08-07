@@ -99,11 +99,10 @@ class TikaGrpcServerImpl extends TikaGrpc.TikaImplBase {
      */
     static final String PARSE_BYTES_FETCHER_ID = "__tika_grpc_parse_bytes";
 
-    /** Soft upper bound for ParseBytes payloads in this PoC (64 MiB). */
-    static final int PARSE_BYTES_MAX_BYTES = 64 * 1024 * 1024;
-
     PipesConfig pipesConfig;
     TikaGrpcConfig tikaGrpcConfig;
+    /** ParseBytes content cap, resolved once at startup from the "grpc" config section. */
+    final long parseBytesMaxContentBytes;
     PipesClient pipesClient;
     FetcherManager fetcherManager;
     ConfigStore configStore;
@@ -146,6 +145,7 @@ class TikaGrpcServerImpl extends TikaGrpc.TikaImplBase {
         // Security-sensitive grpc features (per-request config, runtime component
         // modifications) are off unless explicitly enabled in the "grpc" section.
         tikaGrpcConfig = TikaGrpcConfig.load(tikaJsonConfig);
+        parseBytesMaxContentBytes = tikaGrpcConfig.effectiveParseBytesMaxContentBytes();
 
         pipesClient = new PipesClient(pipesConfig, configPath);
         
@@ -822,11 +822,11 @@ class TikaGrpcServerImpl extends TikaGrpc.TikaImplBase {
         if (content == null || size <= 0) {
             throw new IllegalArgumentException("content is required");
         }
-        // The single place the bound is enforced. The transport has its own, larger
-        // envelope limit; the two are never combined into a third number.
-        if (size > PARSE_BYTES_MAX_BYTES) {
+        // Reject before creating the spool; gRPC bounds the full request separately.
+        if (size > parseBytesMaxContentBytes) {
             throw new ParseBytesTooLargeException(
-                    "content exceeds ParseBytes bound of " + PARSE_BYTES_MAX_BYTES + " bytes");
+                    "content exceeds ParseBytes bound of " + parseBytesMaxContentBytes
+                            + " bytes");
         }
         // createTempFile creates the file up front, so every path out of here that does
         // not hand it to the caller has to delete it -- a failed write included. It also
@@ -936,7 +936,9 @@ class TikaGrpcServerImpl extends TikaGrpc.TikaImplBase {
     }
 
     /**
-     * Raised when declared content exceeds {@link #PARSE_BYTES_MAX_BYTES}. Extends
+     * Raised when declared content exceeds the ParseBytes content cap
+     * ({@link TikaGrpcConfig#DEFAULT_PARSE_BYTES_MAX_CONTENT_BYTES} unless configured).
+     * Extends
      * {@link RuntimeException} directly rather than {@link IllegalArgumentException}:
      * oversize content is a well-formed request the server declines to accept, which is
      * what {@code RESOURCE_EXHAUSTED} exists for, and a disjoint type means dropping the

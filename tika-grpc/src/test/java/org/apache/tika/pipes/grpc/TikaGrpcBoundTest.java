@@ -22,6 +22,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.io.IOException;
 import java.net.ServerSocket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -57,6 +58,7 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import org.apache.tika.config.loader.TikaJsonConfig;
 import org.apache.tika.grpc.v2.ParseBytesReply;
 import org.apache.tika.grpc.v2.ParseBytesRequest;
 import org.apache.tika.grpc.v2.TikaV2Grpc;
@@ -104,9 +106,21 @@ public class TikaGrpcBoundTest {
      * when {@code maxInboundMessageBytes} is null.
      */
     private static Path configWithLimit(Integer maxInboundMessageBytes) throws Exception {
+        return configWithLimits(maxInboundMessageBytes, null);
+    }
+
+    /** Like {@link #configWithLimit} but optionally setting the ParseBytes content cap. */
+    private static Path configWithLimits(Integer maxInboundMessageBytes,
+                                         Long parseBytesMaxContentBytes) throws Exception {
         ObjectNode root = (ObjectNode) OBJECT_MAPPER.readTree(baseConfig.toFile());
-        if (maxInboundMessageBytes != null) {
-            root.putObject("grpc").put("maxInboundMessageBytes", maxInboundMessageBytes);
+        if (maxInboundMessageBytes != null || parseBytesMaxContentBytes != null) {
+            ObjectNode grpc = root.putObject("grpc");
+            if (maxInboundMessageBytes != null) {
+                grpc.put("maxInboundMessageBytes", maxInboundMessageBytes);
+            }
+            if (parseBytesMaxContentBytes != null) {
+                grpc.put("parseBytesMaxContentBytes", parseBytesMaxContentBytes);
+            }
         }
         Path derived = Paths.get("target", "tika-config-bound-"
                 + maxInboundMessageBytes + "-" + UUID.randomUUID() + ".json");
@@ -183,6 +197,22 @@ public class TikaGrpcBoundTest {
             assertTrue(reply.getSerializedSize() < 1024 * 1024,
                     "the reply must stay small, or the test is measuring two limits at once; "
                             + "got " + reply.getSerializedSize() + " bytes");
+        }
+    }
+
+    /** The configured cap is inclusive. */
+    @Test
+    public void contentExactlyAtTheConfiguredCapIsAccepted() throws Exception {
+        try (RealServer s = new RealServer(
+                configWithLimits(DEMO_LIMIT, (long) ABOVE_DEFAULT))) {
+            ParseBytesReply reply = s.v2.parseBytes(ParseBytesRequest.newBuilder()
+                    .setCorrelationId("at-cap-1")
+                    .setContent(bigInputTinyOutput(ABOVE_DEFAULT))
+                    .setResourceName("atcap.html")
+                    .build());
+
+            assertTrue(reply.hasDocument(),
+                    "content of exactly the configured cap must parse");
         }
     }
 
@@ -272,14 +302,46 @@ public class TikaGrpcBoundTest {
      */
     @Test
     public void aTransportLimitAtOrBelowTheContentCapIsAnnounced() {
-        assertNotNull(TikaGrpcServer.inertCapWarning(1024 * 1024),
+        long cap = TikaGrpcConfig.DEFAULT_PARSE_BYTES_MAX_CONTENT_BYTES;
+        assertNotNull(TikaGrpcServer.inertCapWarning(1024 * 1024, cap),
                 "a limit below the cap leaves the cap unreachable");
-        assertNotNull(TikaGrpcServer.inertCapWarning(TikaGrpcServerImpl.PARSE_BYTES_MAX_BYTES),
+        assertNotNull(TikaGrpcServer.inertCapWarning((int) cap, cap),
                 "at equality the envelope overhead still puts the cap out of reach");
-        assertNull(TikaGrpcServer.inertCapWarning(DEMO_LIMIT),
-                "the limit the demo config ships gives the cap real headroom");
-        assertNull(TikaGrpcServer.inertCapWarning(null),
+        assertNull(TikaGrpcServer.inertCapWarning(DEMO_LIMIT, cap),
+                "the limit the demo config ships gives the default cap real headroom");
+        assertNull(TikaGrpcServer.inertCapWarning(null, cap),
                 "no knob is the documented default, not an operator mistake");
+        assertNotNull(TikaGrpcServer.inertCapWarning(DEMO_LIMIT, DEMO_LIMIT * 2L),
+                "a configured cap above the transport limit is unreachable regardless "
+                        + "of the default");
+    }
+
+    /** Both size limits reject non-positive values through the JSON load path. */
+    @Test
+    public void nonPositiveLimitsAreRefusedAtLoad() throws Exception {
+        assertLoadRejects("parseBytesMaxContentBytes", 0);
+        assertLoadRejects("parseBytesMaxContentBytes", -1);
+        assertLoadRejects("maxInboundMessageBytes", 0);
+        assertLoadRejects("maxInboundMessageBytes", -1);
+    }
+
+    private static void assertLoadRejects(String key, long value) throws Exception {
+        Path file = Paths.get("target",
+                "tika-config-badknob-" + UUID.randomUUID() + ".json");
+        FileUtils.write(file.toFile(),
+                "{\"grpc\": {\"" + key + "\": " + value + "}}", StandardCharsets.UTF_8);
+        file.toFile().deleteOnExit();
+        IOException refused = assertThrows(IOException.class,
+                () -> TikaGrpcConfig.load(TikaJsonConfig.load(file)),
+                key + "=" + value + " must be refused at load");
+        Throwable cause = refused;
+        boolean fromValidation = false;
+        while (cause != null && !fromValidation) {
+            fromValidation = String.valueOf(cause.getMessage()).contains("must be positive");
+            cause = cause.getCause();
+        }
+        assertTrue(fromValidation,
+                "the refusal must come from the knob validation, got: " + refused);
     }
 
     /**
@@ -307,10 +369,10 @@ public class TikaGrpcBoundTest {
     @Test
     public void bothWarningsAreCollectedTogether() {
         long mib = 1024L * 1024L;
-        assertEquals(2, TikaGrpcServer.startupWarnings(
-                        TikaGrpcServerImpl.PARSE_BYTES_MAX_BYTES, 100 * mib).size(),
+        long cap = TikaGrpcConfig.DEFAULT_PARSE_BYTES_MAX_CONTENT_BYTES;
+        assertEquals(2, TikaGrpcServer.startupWarnings((int) cap, cap, 100 * mib).size(),
                 "a limit at the cap on a small heap is two separate problems");
-        assertTrue(TikaGrpcServer.startupWarnings(DEMO_LIMIT, 8192 * mib).isEmpty(),
+        assertTrue(TikaGrpcServer.startupWarnings(DEMO_LIMIT, cap, 8192 * mib).isEmpty(),
                 "the demo limit on a healthy heap has nothing to report");
     }
 

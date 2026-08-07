@@ -117,6 +117,7 @@ public class TikaGrpcServer {
         applyInboundLimit(serverBuilder, serviceImpl.tikaGrpcConfig);
         for (String warning : startupWarnings(
                 serviceImpl.tikaGrpcConfig.getMaxInboundMessageBytes(),
+                serviceImpl.tikaGrpcConfig.effectiveParseBytesMaxContentBytes(),
                 Runtime.getRuntime().maxMemory())) {
             LOGGER.warn(warning);
         }
@@ -241,12 +242,13 @@ public class TikaGrpcServer {
      * <p>Returns the message instead of logging it so the condition can be tested without
      * capturing log output.
      */
-    static String inertCapWarning(Integer maxInboundMessageBytes) {
+    static String inertCapWarning(Integer maxInboundMessageBytes,
+                                  long parseBytesMaxContentBytes) {
         if (maxInboundMessageBytes == null
-                || maxInboundMessageBytes > TikaGrpcServerImpl.PARSE_BYTES_MAX_BYTES) {
+                || maxInboundMessageBytes > parseBytesMaxContentBytes) {
             return null;
         }
-        return "ParseBytes accepts content up to " + TikaGrpcServerImpl.PARSE_BYTES_MAX_BYTES
+        return "ParseBytes accepts content up to " + parseBytesMaxContentBytes
                 + " bytes, but this server's maxInboundMessageBytes is "
                 + maxInboundMessageBytes + ". The request also has to carry its other "
                 + "fields, so the transport refuses before the ParseBytes bound applies.";
@@ -262,16 +264,17 @@ public class TikaGrpcServer {
     private static final int HEAP_HEADROOM_MULTIPLE = 3;
 
     /**
-     * The warnings worth emitting at startup about the configured message limit, in the
+     * The warnings worth emitting at startup about the configured message limits, in the
      * order they should be logged, or an empty list when there is nothing to report.
      *
      * <p>One place so there is one loop to log them. The conditions and wording of each
      * warning are unit-tested here as pure functions; that the loop actually reaches the
      * log is covered once, by the real-server test.
      */
-    static List<String> startupWarnings(Integer maxInboundMessageBytes, long maxHeapBytes) {
+    static List<String> startupWarnings(Integer maxInboundMessageBytes,
+                                        long parseBytesMaxContentBytes, long maxHeapBytes) {
         List<String> warnings = new ArrayList<>(2);
-        String inertCap = inertCapWarning(maxInboundMessageBytes);
+        String inertCap = inertCapWarning(maxInboundMessageBytes, parseBytesMaxContentBytes);
         if (inertCap != null) {
             warnings.add(inertCap);
         }
