@@ -99,6 +99,7 @@ public abstract class CXFTestBase {
     protected final static int DIGESTER_READ_LIMIT = 20 * 1024 * 1024;
     protected Server server;
     protected TikaLoader tika;
+    protected TikaResource tikaResource;
     private PipesParser pipesParser;
     private Path pipesConfigPath;
     private Path inputTempDirectory = null;
@@ -214,9 +215,9 @@ public abstract class CXFTestBase {
             pipesConfig.setEmitStrategy(new EmitStrategyConfig(EmitStrategy.PASSBACK_ALL));
             this.pipesParser = PipesParser.load(tikaJsonConfig, pipesConfig, this.pipesConfigPath);
             PipesParsingHelper pipesParsingHelper = new PipesParsingHelper(this.pipesParser, pipesConfig,
-                    inputTempDirectory, getUnpackEmitterBasePath(), false);
+                    inputTempDirectory, getUnpackEmitterBasePath(), isReturnStackTrace());
 
-            TikaResource.init(tika, new ServerStatus(), pipesParsingHelper, isAllowPerRequestConfig());
+            tikaResource = new TikaResource(tika, new ServerStatus(), pipesParsingHelper, isAllowPerRequestConfig());
         } finally {
             // Only delete tika config, keep pipes config for child processes
             Files.deleteIfExists(tmp);
@@ -373,6 +374,14 @@ public abstract class CXFTestBase {
      * this to return true, otherwise the config part is rejected with 403.
      */
     protected boolean isAllowPerRequestConfig() {
+        return false;
+    }
+
+    /**
+     * Mirrors TikaServerConfig.isReturnStackTrace(); defaults to false (production
+     * default). Override in tests that exercise exception-detail visibility.
+     */
+    protected boolean isReturnStackTrace() {
         return false;
     }
 

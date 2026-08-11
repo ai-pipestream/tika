@@ -14,24 +14,27 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.tika.server.core.resource;
-
-import org.apache.tika.pipes.api.ParseMode;
-import org.apache.tika.sax.BasicContentHandlerFactory;
+package org.apache.tika.metadata;
 
 /**
- * Server-internal configuration for request handlers.
- * This holds configuration parsed from HTTP headers for a single request
- * for the BasicContentHandlerFactory kinds of elements.
- * <p>
- * Note: Embedded resource limits are now configured via EmbeddedLimits in ParseContext,
- * not through this config.
+ * Video metadata properties that have no suitable XMPDM equivalent.
+ * See TIKA-4800.
+ *
+ * @since Apache Tika 4.0.0
  */
-public record ServerHandlerConfig(
-        BasicContentHandlerFactory.HANDLER_TYPE type,
-        ParseMode parseMode,
-        int writeLimit,
-        int maxEmbeddedCount,
-        boolean throwOnWriteLimitReached
-) {
+public interface Video {
+
+    /**
+     * Frame rate in frames per second. {@link XMPDM#VIDEO_FRAME_RATE} is a
+     * closed-choice text field (24, NTSC, PAL) and cannot carry an arbitrary
+     * measured rate.
+     */
+    Property FRAME_RATE = Property.internalReal("video:frame-rate");
+
+    /**
+     * Average bitrate in bits per second, from the video track's BitRateBox
+     * ('btrt'). A per-stream value: in a file with several video tracks it
+     * reflects the last one.
+     */
+    Property BITRATE = Property.internalInteger("video:bitrate");
 }

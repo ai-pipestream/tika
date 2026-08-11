@@ -38,6 +38,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import org.apache.tika.metadata.Metadata;
 import org.apache.tika.parser.ParseContext;
@@ -52,6 +53,13 @@ import org.apache.tika.utils.ProcessUtils;
 
 public class TikaServerPipesIntegrationTest extends IntegrationTestBase {
 
+    // Own dedicated static @TempDir, not the inherited (instance, per-test-method)
+    // TEMP_WORKING_DIR from IntegrationTestBase -- @BeforeAll needs a directory
+    // available before any test method runs, and instance-field @TempDir isn't
+    // populated until right before each @Test method regardless of test-instance
+    // lifecycle.
+    @TempDir
+    private static Path SETUP_DIR;
     private static Path TEMP_OUTPUT_DIR;
     private static Path TIKA_CONFIG;
     private static Path TIKA_CONFIG_TIMEOUT;
@@ -59,16 +67,16 @@ public class TikaServerPipesIntegrationTest extends IntegrationTestBase {
 
     @BeforeAll
     public static void setUpBeforeClass() throws Exception {
-        Path inputDir = TEMP_WORKING_DIR.resolve("input");
-        TEMP_OUTPUT_DIR = TEMP_WORKING_DIR.resolve("output");
+        Path inputDir = SETUP_DIR.resolve("input");
+        TEMP_OUTPUT_DIR = SETUP_DIR.resolve("output");
         Files.createDirectories(inputDir);
         Files.createDirectories(TEMP_OUTPUT_DIR);
 
         for (String mockFile : FILES) {
             Files.copy(TikaPipesTest.class.getResourceAsStream("/test-documents/mock/" + mockFile), inputDir.resolve(mockFile));
         }
-        TIKA_CONFIG = TEMP_WORKING_DIR.resolve("tika-config.json");
-        TIKA_CONFIG_TIMEOUT = TEMP_WORKING_DIR.resolve("tika-config-timeout.json");
+        TIKA_CONFIG = SETUP_DIR.resolve("tika-config.json");
+        TIKA_CONFIG_TIMEOUT = SETUP_DIR.resolve("tika-config-timeout.json");
         CXFTestBase.createPluginsConfig(TIKA_CONFIG, inputDir, TEMP_OUTPUT_DIR, null, 5000L);
         CXFTestBase.createPluginsConfig(TIKA_CONFIG_TIMEOUT, inputDir, TEMP_OUTPUT_DIR, null, 500L);
 
@@ -143,7 +151,7 @@ public class TikaServerPipesIntegrationTest extends IntegrationTestBase {
                 "-config", ProcessUtils.escapeCommandLine(TIKA_CONFIG
                 .toAbsolutePath()
                 .toString())});
-        JsonNode node = testOne("system_exit.xml", false);
+        JsonNode node = testOne("system_exit.xml", false, FetchEmitTuple.ON_PARSE_EXCEPTION.EMIT, 503);
         assertEquals("process_crash", node
                 .get("status")
                 .asText());
@@ -160,7 +168,7 @@ public class TikaServerPipesIntegrationTest extends IntegrationTestBase {
                     "-config", ProcessUtils.escapeCommandLine(TIKA_CONFIG
                     .toAbsolutePath()
                     .toString())});
-            JsonNode node = testOne("fake_oom.xml", false);
+            JsonNode node = testOne("fake_oom.xml", false, FetchEmitTuple.ON_PARSE_EXCEPTION.EMIT, 503);
             assertEquals("process_crash", node
                     .get("status")
                     .asText());
@@ -180,7 +188,7 @@ public class TikaServerPipesIntegrationTest extends IntegrationTestBase {
                 "-config", ProcessUtils.escapeCommandLine(TIKA_CONFIG_TIMEOUT
                 .toAbsolutePath()
                 .toString())});
-        JsonNode node = testOne("heavy_hang_30000.xml", false);
+        JsonNode node = testOne("heavy_hang_30000.xml", false, FetchEmitTuple.ON_PARSE_EXCEPTION.EMIT, 503);
         assertEquals("process_crash", node
                 .get("status")
                 .asText());
@@ -198,7 +206,7 @@ public class TikaServerPipesIntegrationTest extends IntegrationTestBase {
                 "-config", ProcessUtils.escapeCommandLine(TIKA_CONFIG
                 .toAbsolutePath()
                 .toString())});
-        JsonNode node = testOneWithPerRequestTimeout("heavy_hang_30000.xml", 100);
+        JsonNode node = testOneWithPerRequestTimeout("heavy_hang_30000.xml", 100, 503);
         assertEquals("process_crash", node
                 .get("status")
                 .asText());
@@ -207,17 +215,15 @@ public class TikaServerPipesIntegrationTest extends IntegrationTestBase {
                 .asText());
     }
 
-    private JsonNode testOneWithPerRequestTimeout(String fileName, long timeoutMillis) throws Exception {
+    private JsonNode testOneWithPerRequestTimeout(String fileName, long timeoutMillis, int expectedStatus) throws Exception {
         awaitServerStartup();
         Response response = WebClient
                 .create(endPoint + "/pipes")
                 .accept("application/json")
                 .post(getJsonStringWithTimeout(fileName, timeoutMillis));
-        if (response.getStatus() == 200) {
-            Reader reader = new InputStreamReader((InputStream) response.getEntity(), UTF_8);
-            return new ObjectMapper().readTree(reader);
-        }
-        return null;
+        assertEquals(expectedStatus, response.getStatus());
+        Reader reader = new InputStreamReader((InputStream) response.getEntity(), UTF_8);
+        return new ObjectMapper().readTree(reader);
     }
 
     private String getJsonStringWithTimeout(String fileName, long timeoutMillis) throws IOException {
@@ -237,27 +243,30 @@ public class TikaServerPipesIntegrationTest extends IntegrationTestBase {
     }
 
     private JsonNode testOne(String fileName, boolean shouldFileExist) throws Exception {
-        return testOne(fileName, shouldFileExist, FetchEmitTuple.ON_PARSE_EXCEPTION.EMIT);
+        return testOne(fileName, shouldFileExist, FetchEmitTuple.ON_PARSE_EXCEPTION.EMIT, 200);
     }
 
     private JsonNode testOne(String fileName, boolean shouldFileExist, FetchEmitTuple.ON_PARSE_EXCEPTION onParseException) throws Exception {
+        return testOne(fileName, shouldFileExist, onParseException, 200);
+    }
+
+    private JsonNode testOne(String fileName, boolean shouldFileExist,
+                              FetchEmitTuple.ON_PARSE_EXCEPTION onParseException, int expectedStatus) throws Exception {
 
         awaitServerStartup();
         Response response = WebClient
                 .create(endPoint + "/pipes")
                 .accept("application/json")
                 .post(getJsonString(fileName, onParseException));
-        if (response.getStatus() == 200) {
-            Path targFile = TEMP_OUTPUT_DIR.resolve(fileName + ".json");
-            if (shouldFileExist) {
-                assertTrue(Files.size(targFile) > 1);
-            } else {
-                assertFalse(Files.isRegularFile(targFile));
-            }
-            Reader reader = new InputStreamReader((InputStream) response.getEntity(), UTF_8);
-            return new ObjectMapper().readTree(reader);
+        assertEquals(expectedStatus, response.getStatus());
+        Path targFile = TEMP_OUTPUT_DIR.resolve(fileName + ".json");
+        if (shouldFileExist) {
+            assertTrue(Files.size(targFile) > 1);
+        } else {
+            assertFalse(Files.isRegularFile(targFile));
         }
-        return null;
+        Reader reader = new InputStreamReader((InputStream) response.getEntity(), UTF_8);
+        return new ObjectMapper().readTree(reader);
     }
 
     @Test
