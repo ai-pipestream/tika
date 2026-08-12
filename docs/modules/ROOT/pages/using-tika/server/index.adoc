@@ -278,6 +278,20 @@ it either way; for the `422` family, the body carries no exception text at all u
 `returnStackTrace=true`. Set `returnStackTrace=true` to get the full trace — useful
 in development, best left off in production.
 
+=== Truncated results (`PARTIAL_TIMEOUT`)
+
+A third case is neither of the above: the worker is healthy, and no exception was
+caught, but the document's total task timeout (`totalTaskTimeoutMillis`) ran out
+partway through, so any not-yet-started embedded documents were skipped rather than
+attempted. This gets its own `PipesResult.RESULT_STATUS`, `PARTIAL_TIMEOUT`, which maps
+to `200 OK` on every endpoint (it is a success, just an incomplete one) alongside
+`PARSE_SUCCESS`, `PARSE_SUCCESS_WITH_EXCEPTION`, etc. The response carries
+`TikaCoreProperties.TASK_DEADLINE_REACHED = true` in its metadata and whatever content
+was extracted before the deadline hit. See
+xref:pipes/timeouts.adoc#_how_timeouts_are_reported[How Timeouts Are Reported] for the
+full mental model, including the pipes-mode `throwOnDeadline` option that trades this
+graceful truncation for a hard failure instead.
+
 == Configuration
 
 Server behavior beyond host/port is controlled by a JSON config file passed via
@@ -307,6 +321,10 @@ Server behavior beyond host/port is controlled by a JSON config file passed via
 |`returnStackTrace`
 |`false`
 |Include parser stack traces in error responses. Useful in dev, dangerous in production (leaks internals).
+
+|`maxRequestSizeBytes`
+|`-1` (no limit)
+|Maximum request body in bytes; larger requests are rejected with `413`. Enforced for chunked uploads too, not just those declaring a `Content-Length`. Uploads are spooled to disk, so leaving this unset lets a caller fill the temp directory.
 
 |`logLevel`
 |_inherited_
