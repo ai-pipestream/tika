@@ -38,6 +38,9 @@ option java_package = "org.apache.tika.grpc.v2";
 
 message Document {
   // envelope
+  // Opaque caller-supplied work key: fetch_key on FetchAndParse, correlation_id
+  // on ParseBytes. Echoed verbatim and never interpreted. It is not content
+  // identity; when available, origin.sha256 identifies the bytes parsed.
   string id = 1;
   string content_type = 2;             // Tika-detected MIME type
   google.protobuf.Timestamp parsed_at = 4;
@@ -62,6 +65,13 @@ message SourceOrigin {
   // digester configured. Downstream consumers use it to tie derived artifacts
   // (annotations, index entries) back to the exact bytes that were parsed.
   string sha256 = 4;
+  // Caller-supplied provenance for parse-only entrypoints (e.g. ParseBytes). These
+  // are never dereferenced by the service; they describe the representation the
+  // caller already captured.
+  string source_uri = 5;
+  string effective_uri = 6;
+  string base_uri = 7;
+  bool truncated = 8;
 }
 
 // =========================================================================

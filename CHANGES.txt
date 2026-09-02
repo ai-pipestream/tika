@@ -1,5 +1,14 @@
 Release 4.1.0 - unreleased
 
+   * tika-grpc: ParseBytes on the experimental TikaV2 service, a parse-only
+     entry point for callers that already hold the bytes (a crawler must not
+     fetch twice). The payload is routed like a tika-server request body:
+     inline via BytesFetcher up to pipes.maxInlineBytes, spooled above it
+     through a per-instance reserved fetcher that is released after the gRPC
+     drain. The content cap ("grpc": {"parseBytesMaxContentBytes"}, 64 MiB by
+     default) and the inbound limit ("grpc": {"maxInboundMessageBytes"}) are
+     separate knobs; the reply is the same typed Document (TIKA-4795).
+
    * New "engines" config section: a map of names to inference engines, each
      an endpoint or local binary with its settings (openai-embedding-engine
      posts up to maxBatchSize images per request to an OpenAI-compatible

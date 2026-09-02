@@ -38,9 +38,19 @@ import org.apache.tika.config.loader.TikaJsonConfig;
  */
 public class TikaGrpcConfig {
 
+    /**
+     * The ParseBytes content cap that governs when {@code parseBytesMaxContentBytes}
+     * is absent from the config.
+     */
+    public static final long DEFAULT_PARSE_BYTES_MAX_CONTENT_BYTES = 64L * 1024 * 1024;
+
     private boolean allowPerRequestConfig = false;
 
     private boolean allowComponentManagement = false;
+
+    private Integer maxInboundMessageBytes = null;
+
+    private Long parseBytesMaxContentBytes = null;
 
     /**
      * Loads {@link TikaGrpcConfig} from the {@code "grpc"} section of the JSON
@@ -102,5 +112,77 @@ public class TikaGrpcConfig {
 
     public void setAllowComponentManagement(boolean allowComponentManagement) {
         this.allowComponentManagement = allowComponentManagement;
+    }
+
+    /**
+     * The largest request the server will accept, in bytes, applied as gRPC's
+     * {@code maxInboundMessageSize}. {@code null} means the key is absent and gRPC's own
+     * default (roughly 4 MiB) governs, which is what an unconfigured server ships with.
+     * <p>
+     * The type is boxed on purpose: "not configured" is a distinct state from any value,
+     * and the server must leave the builder untouched rather than reassert a default of
+     * its own.
+     * <p>
+     * This is server-global. Raising it raises what <em>every</em> RPC will accept,
+     * including the management calls that only ever carry small JSON, and a unary message
+     * is materialised in full in heap before the handler runs, so this also bounds the
+     * heap one <em>request</em> can demand. It is not an aggregate budget: concurrent
+     * requests each get this much, and nothing here caps how many are in flight. It is
+     * also unrelated to the ParseBytes content cap, which bounds only {@code content} and
+     * is enforced separately; the two are never combined into a third number.
+     *
+     * @return the configured inbound limit in bytes, or {@code null} if unset
+     */
+    public Integer getMaxInboundMessageBytes() {
+        return maxInboundMessageBytes;
+    }
+
+    /**
+     * @param maxInboundMessageBytes positive limit in bytes, or {@code null} to defer to
+     *                               gRPC's default
+     * @throws IllegalArgumentException if the value is present and not positive
+     */
+    public void setMaxInboundMessageBytes(Integer maxInboundMessageBytes) {
+        if (maxInboundMessageBytes != null && maxInboundMessageBytes <= 0) {
+            throw new IllegalArgumentException(
+                    "maxInboundMessageBytes must be positive, got: " + maxInboundMessageBytes);
+        }
+        this.maxInboundMessageBytes = maxInboundMessageBytes;
+    }
+
+    /**
+     * Maximum ParseBytes content size, in bytes. {@code null} keeps the 64 MiB default
+     * ({@link #DEFAULT_PARSE_BYTES_MAX_CONTENT_BYTES}). Checked before spooling; gRPC
+     * applies its inbound limit separately to the whole request and may reject it first.
+     * Values above the unary limit only become usable with a future streaming entrypoint.
+     *
+     * @return the configured cap in bytes, or {@code null} if unset
+     */
+    public Long getParseBytesMaxContentBytes() {
+        return parseBytesMaxContentBytes;
+    }
+
+    /**
+     * @param parseBytesMaxContentBytes positive cap in bytes, or {@code null} to use
+     *                                  {@link #DEFAULT_PARSE_BYTES_MAX_CONTENT_BYTES}
+     * @throws IllegalArgumentException if the value is present and not positive
+     */
+    public void setParseBytesMaxContentBytes(Long parseBytesMaxContentBytes) {
+        if (parseBytesMaxContentBytes != null && parseBytesMaxContentBytes <= 0) {
+            throw new IllegalArgumentException(
+                    "parseBytesMaxContentBytes must be positive, got: "
+                            + parseBytesMaxContentBytes);
+        }
+        this.parseBytesMaxContentBytes = parseBytesMaxContentBytes;
+    }
+
+    /**
+     * @return the configured {@link #getParseBytesMaxContentBytes()}, or
+     *         {@link #DEFAULT_PARSE_BYTES_MAX_CONTENT_BYTES} when unset
+     */
+    public long effectiveParseBytesMaxContentBytes() {
+        return parseBytesMaxContentBytes != null
+                ? parseBytesMaxContentBytes
+                : DEFAULT_PARSE_BYTES_MAX_CONTENT_BYTES;
     }
 }
