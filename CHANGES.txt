@@ -1,5 +1,14 @@
 Release 4.1.0 - unreleased
 
+   * tika-grpc: ParseBytes on the experimental TikaV2 service, a parse-only
+     entry point for callers that already hold the bytes (a crawler must not
+     fetch twice). The payload is routed like a tika-server request body:
+     inline via BytesFetcher up to pipes.maxInlineBytes, spooled above it
+     through a per-instance reserved fetcher that is released after the gRPC
+     drain. The content cap ("grpc": {"parseBytesMaxContentBytes"}, 64 MiB by
+     default) and the inbound limit ("grpc": {"maxInboundMessageBytes"}) are
+     separate knobs; the reply is the same typed Document (TIKA-4795).
+
    * Raster previews for the vector thumbnails of Office documents: the new
      poi-metafile-renderer draws EMF and WMF images through POI (a PNG of
      a configurable width; Word's bitmap-in-WMF thumbnails from the bitmap

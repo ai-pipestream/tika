@@ -18,10 +18,16 @@ package org.apache.tika.pipes.grpc;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
+import java.util.UUID;
+import java.util.stream.Stream;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -41,8 +47,11 @@ import org.slf4j.LoggerFactory;
 import org.apache.tika.config.loader.TikaJsonConfig;
 import org.apache.tika.exception.TikaConfigException;
 import org.apache.tika.exception.TikaException;
+import org.apache.tika.io.TikaInputStream;
 import org.apache.tika.metadata.Metadata;
+import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.parser.ParseContext;
+import org.apache.tika.pipes.api.ComponentIds;
 import org.apache.tika.pipes.api.FetchEmitTuple;
 import org.apache.tika.pipes.api.PipesResult;
 import org.apache.tika.pipes.api.emitter.EmitKey;
@@ -53,10 +62,15 @@ import org.apache.tika.pipes.api.pipesiterator.PipesIteratorFactory;
 import org.apache.tika.pipes.core.PipesConfig;
 import org.apache.tika.pipes.core.PipesException;
 import org.apache.tika.pipes.core.PipesParser;
+import org.apache.tika.pipes.core.config.ConfigMerger;
+import org.apache.tika.pipes.core.config.ConfigOverrides;
 import org.apache.tika.pipes.core.config.ConfigStore;
 import org.apache.tika.pipes.core.config.ConfigStoreFactory;
 import org.apache.tika.pipes.core.config.DefaultPluginsDir;
+import org.apache.tika.pipes.core.fetcher.BytesFetcher;
 import org.apache.tika.pipes.core.fetcher.FetcherManager;
+import org.apache.tika.pipes.core.fetcher.InlineBytes;
+import org.apache.tika.pipes.core.fetcher.PayloadRouter;
 import org.apache.tika.pipes.grpc.proto.DeleteFetcherReply;
 import org.apache.tika.pipes.grpc.proto.DeleteFetcherRequest;
 import org.apache.tika.pipes.grpc.proto.DeletePipesIteratorReply;
@@ -95,6 +109,21 @@ class TikaGrpcServerImpl extends TikaGrpc.TikaImplBase {
     PipesConfig pipesConfig;
     TikaGrpcConfig tikaGrpcConfig;
     PipesParser pipesParser;
+    /**
+     * Prefix of the id of this server's ParseBytes spool fetcher, registered into the
+     * effective config at startup (ConfigOverrides, the same mechanism tika-server uses for
+     * its own spool fetcher) so the forked worker can read what PayloadRouter spooled. It
+     * lives in the reserved namespace like every host-wired component, and it ends in a
+     * UUID: servers sharing a config store (the file store re-reads its file on every get)
+     * must never resolve each other's spool directory, and the entry is removed again in
+     * {@link #postShutdown()} so a shared store does not keep one dead fetcher per start.
+     */
+    static final String PARSE_BYTES_FETCHER_PREFIX =
+            ComponentIds.SYSTEM_PREFIX + "tika-grpc-parse-bytes-";
+    final String parseBytesFetcherId = PARSE_BYTES_FETCHER_PREFIX + UUID.randomUUID();
+    long parseBytesMaxContentBytes;
+    Path parseBytesDir;   // package-private for TikaGrpcV2ParseBytesUnitTest
+    private Path effectiveConfigPath;
     FetcherManager fetcherManager;
     ConfigStore configStore;
     Path tikaConfigPath;
@@ -125,50 +154,70 @@ class TikaGrpcServerImpl extends TikaGrpc.TikaImplBase {
         // Security-sensitive grpc features (per-request config, runtime component
         // modifications) are off unless explicitly enabled in the "grpc" section.
         tikaGrpcConfig = TikaGrpcConfig.load(tikaJsonConfig);
-
-        // PipesClient is single-threaded; the pool admits pipes.numClients at a time.
-        pipesParser = PipesParser.load(tikaJsonConfig, pipesConfig, configPath);
-        
+        parseBytesMaxContentBytes = tikaGrpcConfig.effectiveParseBytesMaxContentBytes();
+        // ParseBytes spools payloads above pipes.maxInlineBytes here. The reserved
+        // file-system fetcher is added to an effective config copy (ConfigOverrides +
+        // ConfigMerger, the same way tika-server registers its own spool fetcher), so the
+        // forked worker can read the spool while the user's config file stays untouched.
+        parseBytesDir = Files.createTempDirectory("tika-grpc-parse-bytes");
         try {
-            if (pluginRootsOverride != null && !pluginRootsOverride.trim().isEmpty()) {
-                // Use command-line plugin roots
-                pluginManager = TikaPluginManager.loadFromPaths(pluginRootsOverride);
-            } else {
-                // Use plugin roots from config file
-                pluginManager = TikaPluginManager.load(tikaJsonConfig);
-            }
-            pluginManager.loadPlugins();
-            pluginManager.startPlugins();
-        } catch (TikaConfigException e) {
-            // plugin-roots not configured: probe the install layout like the
-            // other pipes entry points (TIKA-4864/TIKA-4865)
-            String defaultRoot = DefaultPluginsDir.resolve(TikaGrpcServerImpl.class);
-            LOG.warn("plugin-roots not configured ({}); falling back to {}",
-                    e.getMessage(), defaultRoot);
+            Map<String, Object> spoolFetcherConfig = new HashMap<>();
+            spoolFetcherConfig.put("basePath", parseBytesDir.toAbsolutePath().toString());
+            spoolFetcherConfig.put("extractFileSystemMetadata", false);
+            effectiveConfigPath = ConfigMerger.mergeOrCreate(configPath, ConfigOverrides.builder()
+                    .addFetcher(parseBytesFetcherId, "file-system-fetcher", spoolFetcherConfig)
+                    .build()).configPath();
+            tikaJsonConfig = TikaJsonConfig.load(effectiveConfigPath);
+
+            // PipesClient is single-threaded; the pool admits pipes.numClients at a time.
+            pipesParser = PipesParser.load(tikaJsonConfig, pipesConfig, effectiveConfigPath);
+
             try {
-                pluginManager = TikaPluginManager.loadFromPaths(defaultRoot);
+                if (pluginRootsOverride != null && !pluginRootsOverride.trim().isEmpty()) {
+                    // Use command-line plugin roots
+                    pluginManager = TikaPluginManager.loadFromPaths(pluginRootsOverride);
+                } else {
+                    // Use plugin roots from config file
+                    pluginManager = TikaPluginManager.load(tikaJsonConfig);
+                }
                 pluginManager.loadPlugins();
                 pluginManager.startPlugins();
-            } catch (TikaConfigException | IOException e2) {
-                LOG.warn("could not load plugins from {}, starting with none: {}",
-                        defaultRoot, e2.getMessage());
-                pluginManager = new org.pf4j.DefaultPluginManager();
+            } catch (TikaConfigException e) {
+                // plugin-roots not configured: probe the install layout like the
+                // other pipes entry points (TIKA-4864/TIKA-4865)
+                String defaultRoot = DefaultPluginsDir.resolve(TikaGrpcServerImpl.class);
+                LOG.warn("plugin-roots not configured ({}); falling back to {}",
+                        e.getMessage(), defaultRoot);
+                try {
+                    pluginManager = TikaPluginManager.loadFromPaths(defaultRoot);
+                    pluginManager.loadPlugins();
+                    pluginManager.startPlugins();
+                } catch (TikaConfigException | IOException e2) {
+                    LOG.warn("could not load plugins from {}, starting with none: {}",
+                            defaultRoot, e2.getMessage());
+                    pluginManager = new org.pf4j.DefaultPluginManager();
+                }
             }
+
+            if (pluginManager.getPlugins().isEmpty()) {
+                LOG.warn("tika-grpc started with no tika-pipes plugins loaded. "
+                        + "Most RPC calls will fail with 'fetcher type unknown' or "
+                        + "similar. Place tika-pipes-<plugin>-<version>.zip files in "
+                        + "a `plugins/` directory next to tika-grpc.jar (or configure "
+                        + "`plugin-roots` in your tika config). Plugin zips are "
+                        + "published at https://downloads.apache.org/tika/<version>/.");
+            }
+
+            this.configStore = createConfigStore();
+
+            fetcherManager = FetcherManager.load(pluginManager, tikaJsonConfig,
+                    tikaGrpcConfig.isAllowComponentManagement(), this.configStore);
+        } catch (TikaConfigException | IOException | RuntimeException e) {
+            // Nobody gets a reference to a half-built server, so nobody could release what
+            // it acquired: the spool directory, the effective config, the pipes pool.
+            postShutdown();
+            throw e;
         }
-
-        if (pluginManager.getPlugins().isEmpty()) {
-            LOG.warn("tika-grpc started with no tika-pipes plugins loaded. "
-                    + "Most RPC calls will fail with 'fetcher type unknown' or "
-                    + "similar. Place tika-pipes-<plugin>-<version>.zip files in "
-                    + "a `plugins/` directory next to tika-grpc.jar (or configure "
-                    + "`plugin-roots` in your tika config). Plugin zips are "
-                    + "published at https://downloads.apache.org/tika/<version>/.");
-        }
-
-        this.configStore = createConfigStore();
-
-        fetcherManager = FetcherManager.load(pluginManager, tikaJsonConfig,
-                tikaGrpcConfig.isAllowComponentManagement(), this.configStore);
     }
 
     private ConfigStore createConfigStore() throws TikaConfigException {
@@ -402,7 +451,7 @@ class TikaGrpcServerImpl extends TikaGrpc.TikaImplBase {
 
     private void fetchAndParseImpl(FetchAndParseRequest request, ParseContext parseContext,
                                    StreamObserver<FetchAndParseReply> responseObserver) {
-        FetchParseOutcome outcome = runFetchAndParse(
+        FetchParseOutcome outcome = runPublicFetchAndParse(
                 request.getFetcherId(), request.getFetchKey(), parseContext);
         if (outcome == null) {
             return;
@@ -416,6 +465,19 @@ class TikaGrpcServerImpl extends TikaGrpc.TikaImplBase {
             fetchReplyBuilder.setErrorMessage(outcome.errorMessage());
         }
         responseObserver.onNext(fetchReplyBuilder.build());
+    }
+
+    /**
+     * Public-surface variant of {@link #runFetchAndParse}: a host-wired fetcher id (the
+     * reserved {@code __} namespace, this server's spool fetcher among them) fails exactly
+     * the way an id that was never registered fails.
+     */
+    FetchParseOutcome runPublicFetchAndParse(String fetcherId, String fetchKey,
+                                             ParseContext parseContext) {
+        if (ComponentIds.isSystem(fetcherId)) {
+            throw new RuntimeException("Could not find fetcher with name " + fetcherId);
+        }
+        return runFetchAndParse(fetcherId, fetchKey, parseContext);
     }
 
     /**
@@ -439,46 +501,195 @@ class TikaGrpcServerImpl extends TikaGrpc.TikaImplBase {
         // inside the forked pipes worker, so this is fetch+parse latency, not parse-only.
         long fetchParseStart = System.nanoTime();
         try {
-            PipesResult pipesResult = pipesParser.parse(new FetchEmitTuple(
+            return executeTuple(new FetchEmitTuple(
                     fetchKey,
                     new FetchKey(fetcher.getExtensionConfig().id(), fetchKey),
                     new EmitKey(),
                     tikaMetadata,
                     parseContext,
-                    FetchEmitTuple.ON_PARSE_EXCEPTION.SKIP));
-            long fetchParseTimeMs = (System.nanoTime() - fetchParseStart) / 1_000_000L;
-            Map<String, String> fields = new LinkedHashMap<>();
-            Metadata primary = null;
-            if (pipesResult.emitData() != null && pipesResult.emitData().getMetadataList() != null) {
-                for (Metadata metadata : pipesResult.emitData().getMetadataList()) {
-                    for (String name : metadata.names()) {
-                        String value = metadata.get(name);
-                        if (value != null) {
-                            fields.put(name, value);
-                        }
-                    }
-                }
-                if (!pipesResult.emitData().getMetadataList().isEmpty()) {
-                    primary = pipesResult.emitData().getMetadataList().get(0);
-                }
-            }
-            String errorMessage = null;
-            if (pipesResult.status().equals(PipesResult.RESULT_STATUS.FETCH_EXCEPTION)) {
-                errorMessage = pipesResult.message();
-            }
-            return new FetchParseOutcome(
-                    fetchKey,
-                    pipesResult.status().name(),
-                    errorMessage,
-                    fields,
-                    primary,
-                    fetchParseTimeMs);
+                    FetchEmitTuple.ON_PARSE_EXCEPTION.SKIP), fetchParseStart);
         } catch (IOException | PipesException e) {
             throw new RuntimeException(e);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return null;
         }
+    }
+
+    /** Runs one tuple through the pipes parser and folds the result into an outcome. */
+    FetchParseOutcome executeTuple(FetchEmitTuple tuple, long fetchParseStart)
+            throws PipesException, InterruptedException, IOException {
+        String fetchKey = tuple.getFetchKey().getFetchKey();
+        PipesResult pipesResult = pipesParser.parse(tuple);
+        long fetchParseTimeMs = (System.nanoTime() - fetchParseStart) / 1_000_000L;
+        Map<String, String> fields = new LinkedHashMap<>();
+        Metadata primary = null;
+        if (pipesResult.emitData() != null && pipesResult.emitData().getMetadataList() != null) {
+            for (Metadata metadata : pipesResult.emitData().getMetadataList()) {
+                for (String name : metadata.names()) {
+                    String value = metadata.get(name);
+                    if (value != null) {
+                        fields.put(name, value);
+                    }
+                }
+            }
+            if (!pipesResult.emitData().getMetadataList().isEmpty()) {
+                primary = pipesResult.emitData().getMetadataList().get(0);
+            }
+        }
+        String errorMessage = null;
+        if (pipesResult.status().equals(PipesResult.RESULT_STATUS.FETCH_EXCEPTION)) {
+            errorMessage = pipesResult.message();
+        }
+        return new FetchParseOutcome(
+                fetchKey,
+                pipesResult.status().name(),
+                errorMessage,
+                fields,
+                primary,
+                fetchParseTimeMs);
+    }
+
+    /**
+     * Parses the exact bytes the caller already holds and returns the parse outcome.
+     *
+     * <p>The bytes are routed the same way tika-server routes request bodies
+     * ({@link PayloadRouter}): at or under {@code pipes.maxInlineBytes} they travel inline in
+     * the IPC message via {@link BytesFetcher}; above it they are spooled into
+     * {@code parseBytesDir} and fetched by the reserved {@link #parseBytesFetcherId}
+     * file-system fetcher. Either way the spool never becomes document semantics: the
+     * returned metadata is a {@link #sanitizedCopy(Metadata, String)}.
+     *
+     * @param requestContext the per-request context already validated by
+     *                       {@link #buildRequestParseContext}; {@code null} means none
+     * @return {@code null} when the calling thread was interrupted before a reply could be built
+     */
+    ParseBytesOutcome runParseBytes(InputStream content, long size, String resourceNameHint,
+                                    ParseContext requestContext) throws IOException {
+        if (content == null || size <= 0) {
+            throw new IllegalArgumentException("content is required");
+        }
+        // Reject before routing; gRPC bounds the full request separately.
+        if (size > parseBytesMaxContentBytes) {
+            throw new ParseBytesTooLargeException(
+                    "content exceeds ParseBytes bound of " + parseBytesMaxContentBytes
+                            + " bytes");
+        }
+        Metadata tikaMetadata = new Metadata();
+        if (resourceNameHint != null && !resourceNameHint.isBlank()) {
+            tikaMetadata.set(TikaCoreProperties.RESOURCE_NAME_KEY, resourceNameHint.trim());
+        }
+        long fetchParseStart = System.nanoTime();
+        try (TikaInputStream tis = TikaInputStream.get(content);
+                PayloadRouter.Routed routed = PayloadRouter.route(tis,
+                        pipesConfig.getMaxInlineBytes(),
+                        () -> Files.createTempFile(parseBytesDir, "parse-bytes-", ""))) {
+            ParseContext parseContext =
+                    requestContext == null ? new ParseContext() : requestContext;
+            FetchKey fetchKey;
+            if (routed.isInline()) {
+                parseContext.set(InlineBytes.class, routed.inlineBytes());
+                // The fetch key doubles as the caller's filename: nothing to scrub later.
+                fetchKey = new FetchKey(BytesFetcher.FETCHER_ID,
+                        resourceNameHint == null ? "" : resourceNameHint.trim());
+            } else {
+                fetchKey = new FetchKey(parseBytesFetcherId,
+                        routed.path().getFileName().toString());
+            }
+            FetchParseOutcome outcome = executeTuple(new FetchEmitTuple(
+                    fetchKey.getFetchKey(),
+                    fetchKey,
+                    new EmitKey(),
+                    tikaMetadata,
+                    parseContext,
+                    FetchEmitTuple.ON_PARSE_EXCEPTION.SKIP), fetchParseStart);
+            if (outcome == null) {
+                return null;
+            }
+            return new ParseBytesOutcome(
+                    sanitizedCopy(outcome.primary(), resourceNameHint),
+                    outcome.status(),
+                    outcome.fetchParseTimeMs());
+        } catch (PipesException e) {
+            throw new RuntimeException(e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return null;
+        }
+    }
+
+    /**
+     * Copies the parse metadata without the two traces the spool file leaves in it: the
+     * fetcher records the fetch key under {@link TikaCoreProperties#SOURCE_PATH}, and
+     * Tika falls back to the spool filename as the resource name when the caller
+     * supplied none. The copy is owned by the outcome, so nothing downstream shares
+     * state with the pipes result.
+     *
+     * <p>The copy is written as a trusted transformation target, which is what
+     * {@link Metadata#addTrusted(String, String)} exists for: plain writes drop reserved
+     * Tika metadata keys such as the parsed-by chain and the observed digest.
+     *
+     * @return {@code null} when {@code source} is null, since that is how the mapper
+     *         distinguishes "pipes returned no metadata" from an empty document
+     */
+    private static Metadata sanitizedCopy(Metadata source, String resourceNameHint) {
+        if (source == null) {
+            // null means "pipes returned no metadata at all" and DocumentBuilder relies on
+            // that distinction; an empty Metadata would report a failure as an empty
+            // document.
+            return null;
+        }
+        Metadata copy = new Metadata();
+        boolean dropResourceName = resourceNameHint == null || resourceNameHint.isBlank();
+        String sourcePathKey = TikaCoreProperties.SOURCE_PATH.getName();
+        String resourceNameKey = TikaCoreProperties.RESOURCE_NAME_KEY.getName();
+        for (String name : source.names()) {
+            if (name.equals(sourcePathKey)
+                    || (dropResourceName && name.equals(resourceNameKey))) {
+                continue;
+            }
+            for (String value : source.getValues(name)) {
+                copy.addTrusted(name, value);
+            }
+        }
+        return copy;
+    }
+
+    static void deleteQuietly(Path path) {
+        if (path == null) {
+            return;
+        }
+        try {
+            Files.deleteIfExists(path);
+        } catch (IOException e) {
+            LOG.debug("Could not delete {}", path, e);
+        }
+    }
+
+    private static void deleteRecursivelyQuietly(Path dir) {
+        if (dir == null || !Files.exists(dir)) {
+            return;
+        }
+        try (Stream<Path> walk = Files.walk(dir)) {
+            walk.sorted(Comparator.reverseOrder()).forEach(TikaGrpcServerImpl::deleteQuietly);
+        } catch (IOException e) {
+            LOG.warn("Could not clean ParseBytes temp dir {}", dir, e);
+        }
+    }
+
+    static final class ParseBytesTooLargeException extends RuntimeException {
+        ParseBytesTooLargeException(String message) {
+            super(message);
+        }
+    }
+
+    /**
+     * Outcome of a ParseBytes round trip. The spool file, when one existed, is already
+     * deleted by the time this is constructed: {@link PayloadRouter.Routed} owns it and the
+     * try-with-resources in {@link #runParseBytes} closes it right after the parse.
+     * {@code null} primary means the pipes worker returned no metadata at all.
+     */
+    record ParseBytesOutcome(Metadata primary, String status, long fetchParseTimeMs) {
     }
 
     /**
@@ -498,6 +709,14 @@ class TikaGrpcServerImpl extends TikaGrpc.TikaImplBase {
     @Override
     public void saveFetcher(SaveFetcherRequest request,
                               StreamObserver<SaveFetcherReply> responseObserver) {
+        // Host-wired fetchers (reserved namespace) must not be replaced. Save has no
+        // unknown-id twin (an unknown id creates a fetcher), so refuse neutrally.
+        if (ComponentIds.isSystem(request.getFetcherId())) {
+            responseObserver.onError(io.grpc.Status.INVALID_ARGUMENT
+                    .withDescription("invalid fetcher id")
+                    .asRuntimeException());
+            return;
+        }
         if (denyComponentManagement(responseObserver)) {
             return;
         }
@@ -557,6 +776,13 @@ class TikaGrpcServerImpl extends TikaGrpc.TikaImplBase {
     @Override
     public void getFetcher(GetFetcherRequest request,
                            StreamObserver<GetFetcherReply> responseObserver) {
+        // Host-wired fetchers (reserved namespace): identical answer to an id that does not
+        // exist.
+        if (ComponentIds.isSystem(request.getFetcherId())) {
+            responseObserver.onError(StatusProto.toStatusException(
+                    notFoundStatus(request.getFetcherId())));
+            return;
+        }
         GetFetcherReply.Builder getFetcherReply = GetFetcherReply.newBuilder();
         try {
             Fetcher fetcher = fetcherManager.getFetcher(request.getFetcherId());
@@ -611,6 +837,13 @@ class TikaGrpcServerImpl extends TikaGrpc.TikaImplBase {
     @Override
     public void deleteFetcher(DeleteFetcherRequest request,
                               StreamObserver<DeleteFetcherReply> responseObserver) {
+        // Host-wired fetchers (reserved namespace): identical answer to an id that does not
+        // exist (success=false, no error).
+        if (ComponentIds.isSystem(request.getFetcherId())) {
+            responseObserver.onNext(DeleteFetcherReply.newBuilder().setSuccess(false).build());
+            responseObserver.onCompleted();
+            return;
+        }
         if (denyComponentManagement(responseObserver)) {
             return;
         }
@@ -806,5 +1039,31 @@ class TikaGrpcServerImpl extends TikaGrpc.TikaImplBase {
                 pipesParser = null;
             }
         }
+        // TikaGrpcServer.stop() calls shutdown() before the gRPC server drains and this
+        // after it: only here can no request still be reading the spool.
+        if (configStore != null) {
+            // This server and its forks put the spool fetcher into the store at their start;
+            // in a shared store it would outlive the directory it points at. containsKey first:
+            // a file-backed store re-reads its file on lookups but not on remove, which writes
+            // this JVM's cache back -- stale, it would take other servers' entries with it.
+            try {
+                if (configStore.containsKey(parseBytesFetcherId)) {
+                    configStore.remove(parseBytesFetcherId);
+                }
+            } catch (RuntimeException e) {
+                LOG.debug("Could not remove {} from the config store", parseBytesFetcherId, e);
+            }
+        }
+        releaseParseBytesArtifacts();
+    }
+
+    /** Removes the spool directory and the effective config; safe to call more than once. */
+    private void releaseParseBytesArtifacts() {
+        deleteRecursivelyQuietly(parseBytesDir);
+        parseBytesDir = null;
+        if (effectiveConfigPath != null && !effectiveConfigPath.equals(tikaConfigPath)) {
+            deleteQuietly(effectiveConfigPath);
+        }
+        effectiveConfigPath = null;
     }
 }

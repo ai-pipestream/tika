@@ -22,6 +22,13 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
 import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -45,6 +52,7 @@ import com.asarkar.grpc.test.Resources;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.google.common.collect.ImmutableMap;
+import com.google.protobuf.ByteString;
 import io.grpc.ManagedChannel;
 import io.grpc.Server;
 import io.grpc.Status;
@@ -55,6 +63,7 @@ import io.grpc.stub.StreamObserver;
 import org.apache.commons.io.FileUtils;
 import org.jetbrains.annotations.NotNull;
 import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -63,6 +72,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.tika.grpc.v2.Document;
+import org.apache.tika.grpc.v2.ParseBytesReply;
+import org.apache.tika.grpc.v2.ParseBytesRequest;
 import org.apache.tika.grpc.v2.TikaV2Grpc;
 import org.apache.tika.metadata.TikaCoreProperties;
 import org.apache.tika.pipes.api.PipesResult;
@@ -95,6 +106,10 @@ public class TikaGrpcServerTest {
     // the CRUD/streaming tests, which save fetchers at runtime.
     static Path tikaConfigUnlocked =
             Paths.get("target", "tika-config-unlocked-" + UUID.randomUUID() + ".json");
+    // Digest-enabled variant: a SHA-256 digester in parse-context, for the
+    // observed-digest oracle test.
+    static Path tikaConfigDigest =
+            Paths.get("target", "tika-config-digest-" + UUID.randomUUID() + ".json");
 
 
     @BeforeAll
@@ -131,6 +146,40 @@ public class TikaGrpcServerTest {
         FileUtils.write(tikaConfigUnlocked.toFile(),
                 OBJECT_MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(root),
                 StandardCharsets.UTF_8);
+
+        // Derive a digest-enabled variant: SHA-256 digester as a direct parse-context
+        // component key -- the shape the loader resolves (CommonsDigesterFactory is a
+        // registered component; cf. tika-server's CXFTestBase config).
+        ObjectNode digestRoot = (ObjectNode) OBJECT_MAPPER.readTree(tikaConfig.toFile());
+        ObjectNode parseCtx = digestRoot.has("parse-context")
+                && digestRoot.get("parse-context").isObject()
+                ? (ObjectNode) digestRoot.get("parse-context")
+                : digestRoot.putObject("parse-context");
+        ObjectNode digesterFactory = parseCtx.putObject("commons-digester-factory");
+        digesterFactory.putArray("digests").addObject().put("algorithm", "SHA256");
+        digesterFactory.put("skipContainerDocumentDigest", false);
+        FileUtils.write(tikaConfigDigest.toFile(),
+                OBJECT_MAPPER.writerWithDefaultPrettyPrinter().writeValueAsString(digestRoot),
+                StandardCharsets.UTF_8);
+    }
+
+    // Every impl a test starts, released after it: the pipes pool and the ParseBytes spool
+    // directory are only let go by postShutdown(), which the gRPC Resources never call.
+    private static final List<TikaGrpcServerImpl> STARTED = new ArrayList<>();
+
+    private static TikaGrpcServerImpl newImpl(Path config) throws Exception {
+        TikaGrpcServerImpl impl = new TikaGrpcServerImpl(config.toAbsolutePath().toString());
+        STARTED.add(impl);
+        return impl;
+    }
+
+    @AfterEach
+    void releaseStartedImpls() {
+        for (TikaGrpcServerImpl impl : STARTED) {
+            impl.shutdown();
+            impl.postShutdown();
+        }
+        STARTED.clear();
     }
 
     @AfterAll
@@ -138,6 +187,7 @@ public class TikaGrpcServerTest {
         try {
             Files.deleteIfExists(tikaConfig);
             Files.deleteIfExists(tikaConfigUnlocked);
+            Files.deleteIfExists(tikaConfigDigest);
         } catch (Exception e) {
             LOG.warn("Failed to delete {}", tikaConfig, e);
         }
@@ -149,8 +199,7 @@ public class TikaGrpcServerTest {
     public void testFetcherCrud(Resources resources) throws Exception {
         String serverName = InProcessServerBuilder.generateName();
 
-        TikaGrpcServerImpl serviceImpl =
-                new TikaGrpcServerImpl(tikaConfigUnlocked.toAbsolutePath().toString());
+        TikaGrpcServerImpl serviceImpl = newImpl(tikaConfigUnlocked);
         Server server = InProcessServerBuilder
                 .forName(serverName)
                 .directExecutor()
@@ -458,7 +507,7 @@ public class TikaGrpcServerTest {
 
     private static ManagedChannel startChannel(Resources resources, Path config) throws Exception {
         String serverName = InProcessServerBuilder.generateName();
-        TikaGrpcServerImpl serviceImpl = new TikaGrpcServerImpl(config.toAbsolutePath().toString());
+        TikaGrpcServerImpl serviceImpl = newImpl(config);
         Server server = InProcessServerBuilder
                 .forName(serverName)
                 .directExecutor()
@@ -576,7 +625,7 @@ public class TikaGrpcServerTest {
         Server server = InProcessServerBuilder
                 .forName(serverName)
                 .directExecutor()
-                .addService(new TikaGrpcServerImpl(tikaConfigUnlocked.toAbsolutePath().toString()))
+                .addService(newImpl(tikaConfigUnlocked))
                 .build()
                 .start();
         resources.register(server, Duration.ofSeconds(10));
@@ -757,5 +806,277 @@ public class TikaGrpcServerTest {
         } finally {
             FileUtils.deleteDirectory(testDocumentFolder);
         }
+    }
+
+    /**
+     * TIKA-4795 PoC: ParseBytes needs no fetcher registration (works with component
+     * management denied) and returns the same v2 Document.
+     */
+    @Test
+    public void testParseBytesNeedsNoFetcherRegistration(Resources resources) throws Exception {
+        ManagedChannel channel = startChannel(resources, tikaConfig);
+        TikaV2Grpc.TikaV2BlockingStub v2 = TikaV2Grpc.newBlockingStub(channel);
+
+        ParseBytesReply reply = v2.parseBytes(ParseBytesRequest.newBuilder()
+                .setCorrelationId("bytes-1")
+                .setContent(com.google.protobuf.ByteString.copyFromUtf8(
+                        "<html><head><title>Bytes</title></head><body>Hello from raw bytes.</body></html>"))
+                .setResourceName("page.html")
+                .setSourceUri("https://example.com/page.html")
+                .setEffectiveUri("https://example.com/page.html")
+                .setBaseUri("https://example.com/")
+                .setTruncated(false)
+                .build());
+
+        assertEquals("bytes-1", reply.getCorrelationId());
+        Document document = reply.getDocument();
+        assertEquals("bytes-1", document.getId());
+        assertEquals("PARSE_SUCCESS", document.getStatus().getPipesStatus(),
+                "errors=" + document.getStatus().getErrorsList());
+        assertTrue(document.getContentType().startsWith("text/html"),
+                "detected content type, got: " + document.getContentType());
+        assertEquals("page.html", document.getOrigin().getFilename());
+        assertEquals("https://example.com/page.html", document.getOrigin().getSourceUri());
+    }
+
+    /**
+     * TIKA-4795's central promise: the parse uses the bytes it was given and never
+     * acquires the resource. The provenance URIs point at a local HTTP sentinel that
+     * counts requests <em>before</em> it answers, so a synchronous dereference could not
+     * return from the parse without having been counted -- no post-parse wait is needed.
+     *
+     * <p>Scope of the claim: this observes requests to these URIs, not that nothing
+     * whatsoever was acquired.
+     */
+    @Test
+    public void testParseBytesDoesNotDereferenceProvenanceUris(Resources resources)
+            throws Exception {
+        ManagedChannel channel = startChannel(resources, tikaConfig);
+        TikaV2Grpc.TikaV2BlockingStub v2 = TikaV2Grpc.newBlockingStub(channel);
+
+        // Plain ServerSocket: forbiddenapis rejects com.sun.net.httpserver as non-portable.
+        AtomicInteger requests = new AtomicInteger();
+        ServerSocket sentinel = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
+        Thread acceptor = new Thread(() -> {
+            byte[] body = "sentinel".getBytes(StandardCharsets.UTF_8);
+            byte[] head = ("HTTP/1.1 200 OK\r\nContent-Length: " + body.length
+                    + "\r\nConnection: close\r\n\r\n").getBytes(StandardCharsets.UTF_8);
+            while (true) {
+                try (Socket socket = sentinel.accept()) {
+                    // Count BEFORE answering: a synchronous dereference cannot return
+                    // from the parse without having been counted.
+                    requests.incrementAndGet();
+                    // Wait for the request to start before replying, then answer.
+                    if (socket.getInputStream().read() == -1) {
+                        continue;
+                    }
+                    OutputStream out = socket.getOutputStream();
+                    out.write(head);
+                    out.write(body);
+                    out.flush();
+                } catch (IOException e) {
+                    return; // sentinel closed
+                }
+            }
+        }, "no-deref-sentinel");
+        acceptor.setDaemon(true);
+        acceptor.start();
+        try {
+            // URI builds an IPv6-safe authority (bracketed literal); concatenation would not.
+            String host = sentinel.getInetAddress().getHostAddress();
+            int port = sentinel.getLocalPort();
+            URI pageUri = new URI("http", null, host, port, "/page.html", null, null);
+            URI baseUri = new URI("http", null, host, port, "/", null, null);
+
+            // Prove the sentinel counts, so a zero below cannot pass on a broken mechanism.
+            try (InputStream probe = pageUri.toURL().openStream()) {
+                assertNotNull(probe.readAllBytes());
+            }
+            assertEquals(1, requests.get(), "the sentinel must count a real request");
+            requests.set(0);
+
+            // A relative link plus a base URI gives any accidental dereference a valid
+            // local target.
+            ParseBytesReply reply = v2.parseBytes(ParseBytesRequest.newBuilder()
+                    .setCorrelationId("no-deref-1")
+                    .setContent(ByteString.copyFromUtf8(
+                            "<html><head><title>Bytes</title></head><body>"
+                                    + "<a href=\"linked.html\">link</a> Hello from raw bytes."
+                                    + "</body></html>"))
+                    .setResourceName("page.html")
+                    .setSourceUri(pageUri.toString())
+                    .setEffectiveUri(pageUri.toString())
+                    .setBaseUri(baseUri.toString())
+                    .build());
+
+            assertEquals("PARSE_SUCCESS", reply.getDocument().getStatus().getPipesStatus(),
+                    "errors=" + reply.getDocument().getStatus().getErrorsList());
+            assertEquals("Bytes", reply.getDocument().getMetadata().getTitle(),
+                    "the parsed content must come from the supplied payload");
+            assertEquals(0, requests.get(),
+                    "ParseBytes must not dereference the caller's provenance URIs");
+        } finally {
+            sentinel.close();
+        }
+    }
+
+    /**
+     * INV-SPOOL: the internal spool file stays invisible to the caller, and the caller's
+     * resource name reaches detection as metadata rather than as a filename.
+     */
+    @Test
+    public void testParseBytesSpoolStaysInternal(Resources resources) throws Exception {
+        ManagedChannel channel = startChannel(resources, tikaConfig);
+        TikaV2Grpc.TikaV2BlockingStub v2 = TikaV2Grpc.newBlockingStub(channel);
+
+        // Longer than any filesystem allows a name to be, and text/x-java-source has no
+        // magic bytes: only the caller's name can produce that type.
+        String longName = "a".repeat(300) + ".java";
+        ParseBytesReply reply = v2.parseBytes(ParseBytesRequest.newBuilder()
+                .setCorrelationId("spool-1")
+                .setContent(ByteString.copyFromUtf8("class Spool { void f() {} }\n"))
+                .setResourceName(longName)
+                .build());
+
+        Document document = reply.getDocument();
+        assertEquals("PARSE_SUCCESS", document.getStatus().getPipesStatus(),
+                "errors=" + document.getStatus().getErrorsList());
+        assertEquals("text/x-java-source", document.getContentType(),
+                "detection must see the caller's name, not the spool filename");
+        assertEquals(longName, document.getOrigin().getFilename());
+        assertTrue(document.getExtraList().stream().noneMatch(field ->
+                        field.getKey().equals("X-TIKA:sourcePath")),
+                "the internal spool key must not leak into the metadata tail");
+        Assertions.assertFalse(document.getStatus().getParsersUsedList().isEmpty(),
+                "the sanitized copy must preserve reserved X-TIKA keys such as Parsed-By");
+        Assertions.assertFalse(document.toString().contains("parse-bytes-"),
+                "no part of the spool filename may appear in the Document");
+
+        ParseBytesReply anonymous = v2.parseBytes(ParseBytesRequest.newBuilder()
+                .setCorrelationId("spool-2")
+                .setContent(ByteString.copyFromUtf8("<html><body>anonymous</body></html>"))
+                .build());
+        assertEquals("", anonymous.getDocument().getOrigin().getFilename(),
+                "with no resource name supplied, none may be invented from the spool file");
+    }
+
+    private static String sha256Hex(byte[] bytes) throws Exception {
+        return java.util.HexFormat.of().formatHex(
+                java.security.MessageDigest.getInstance("SHA-256").digest(bytes));
+    }
+
+    /**
+     * origin.sha256 is the digest the pipeline itself recorded: with a SHA-256 digester
+     * configured it matches an in-test JDK digest of the exact request bytes.
+     */
+    @Test
+    public void testParseBytesObservedDigestMatchesIndependentOracle(Resources resources)
+            throws Exception {
+        ManagedChannel channel = startChannel(resources, tikaConfigDigest);
+        TikaV2Grpc.TikaV2BlockingStub v2 = TikaV2Grpc.newBlockingStub(channel);
+
+        byte[] payload = "<html><body>digest oracle</body></html>"
+                .getBytes(StandardCharsets.UTF_8);
+        ParseBytesReply reply = v2.parseBytes(ParseBytesRequest.newBuilder()
+                .setCorrelationId("digest-oracle")
+                .setContent(ByteString.copyFrom(payload))
+                .build());
+
+        assertEquals(sha256Hex(payload), reply.getDocument().getOrigin().getSha256(),
+                "the pipeline digest must match the in-test JDK digest of the exact request bytes");
+    }
+
+    /**
+     * The ParseBytes fetcher is server-internal: through every public surface it behaves
+     * like an id that does not exist -- absent from list, NOT_FOUND on get, success=false
+     * on delete, refused on save, and not selectable as a FetchAndParse fetcher id.
+     * ParseBytes itself keeps working, because it alone may use it.
+     */
+    @Test
+    public void testInternalParseBytesFetcherIsNotPubliclyReachable(Resources resources)
+            throws Exception {
+        String serverName = InProcessServerBuilder.generateName();
+        TikaGrpcServerImpl serviceImpl = newImpl(tikaConfigUnlocked);
+        Server server = InProcessServerBuilder
+                .forName(serverName)
+                .directExecutor()
+                .addService(serviceImpl)
+                .addService(new TikaGrpcV2ServerImpl(serviceImpl))
+                .build()
+                .start();
+        resources.register(server, Duration.ofSeconds(10));
+        ManagedChannel channel = InProcessChannelBuilder
+                .forName(serverName)
+                .directExecutor()
+                .build();
+        resources.register(channel, Duration.ofSeconds(10));
+        TikaGrpc.TikaBlockingStub v1 = TikaGrpc.newBlockingStub(channel);
+        TikaV2Grpc.TikaV2BlockingStub v2 = TikaV2Grpc.newBlockingStub(channel);
+        String internal = serviceImpl.parseBytesFetcherId;
+        String unknown = "no-such-fetcher-" + UUID.randomUUID();
+
+        ListFetchersReply listed = v1.listFetchers(ListFetchersRequest.newBuilder().build());
+        assertTrue(listed.getGetFetcherRepliesList().stream()
+                        .noneMatch(f -> f.getFetcherId().equals(internal)),
+                "the internal fetcher must not be enumerable");
+
+        for (String id : new String[] {internal, unknown}) {
+            StatusRuntimeException ex = Assertions.assertThrows(StatusRuntimeException.class,
+                    () -> v1.getFetcher(GetFetcherRequest.newBuilder().setFetcherId(id).build()));
+            assertEquals(Status.Code.NOT_FOUND, ex.getStatus().getCode(), "get " + id);
+        }
+
+        for (String id : new String[] {internal, unknown}) {
+            DeleteFetcherReply del = v1.deleteFetcher(
+                    DeleteFetcherRequest.newBuilder().setFetcherId(id).build());
+            Assertions.assertFalse(del.getSuccess(), "delete " + id);
+        }
+
+        StatusRuntimeException saveEx = Assertions.assertThrows(StatusRuntimeException.class,
+                () -> v1.saveFetcher(SaveFetcherRequest.newBuilder()
+                        .setFetcherId(internal)
+                        .setFetcherType("file-system-fetcher")
+                        .setFetcherConfigJson("{\"basePath\":\"/tmp\"}")
+                        .build()));
+        assertEquals(Status.Code.INVALID_ARGUMENT, saveEx.getStatus().getCode());
+
+        // The internal id is not selectable as a FetchAndParse fetcher: it fails the same
+        // way an id that was never registered fails.
+        for (String id : new String[] {internal, unknown}) {
+            StatusRuntimeException ex = Assertions.assertThrows(StatusRuntimeException.class,
+                    () -> v1.fetchAndParse(FetchAndParseRequest.newBuilder()
+                            .setFetcherId(id)
+                            .setFetchKey("parse-bytes-probe")
+                            .build()));
+            assertEquals(Status.Code.UNKNOWN, ex.getStatus().getCode(), "fetch " + id);
+        }
+
+        ParseBytesReply reply = v2.parseBytes(ParseBytesRequest.newBuilder()
+                .setCorrelationId("crud-1")
+                .setContent(ByteString.copyFromUtf8("<html><body>still here</body></html>"))
+                .build());
+        assertEquals("PARSE_SUCCESS", reply.getDocument().getStatus().getPipesStatus(),
+                "ParseBytes must still work after management and fetch attempts on its fetcher");
+    }
+
+    /**
+     * ParseBytes takes the same {@code parse_context_json} gate as FetchAndParse (TIKA-4848):
+     * an entry nothing is registered under is refused here, as INVALID_ARGUMENT naming it,
+     * instead of exiting the forked worker.
+     */
+    @Test
+    public void testParseBytesRejectsUnrecognizedParseContextEntry(Resources resources)
+            throws Exception {
+        ManagedChannel channel = startChannel(resources, tikaConfigUnlocked);
+        TikaV2Grpc.TikaV2BlockingStub v2 = TikaV2Grpc.newBlockingStub(channel);
+
+        StatusRuntimeException ex = Assertions.assertThrows(StatusRuntimeException.class, () ->
+                v2.parseBytes(ParseBytesRequest.newBuilder()
+                        .setContent(ByteString.copyFromUtf8("<html><body>x</body></html>"))
+                        .setParseContextJson("{\"no-such-component\":{}}")
+                        .build()));
+        assertEquals(Status.Code.INVALID_ARGUMENT, ex.getStatus().getCode());
+        assertTrue(String.valueOf(ex.getStatus().getDescription()).contains("no-such-component"),
+                "the caller must be told which entry: " + ex.getStatus().getDescription());
     }
 }
