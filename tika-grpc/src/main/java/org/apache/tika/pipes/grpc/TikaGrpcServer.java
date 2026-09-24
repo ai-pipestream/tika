@@ -24,6 +24,8 @@ import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 import com.beust.jcommander.JCommander;
@@ -31,6 +33,7 @@ import com.beust.jcommander.Parameter;
 import io.grpc.Grpc;
 import io.grpc.InsecureServerCredentials;
 import io.grpc.Server;
+import io.grpc.ServerBuilder;
 import io.grpc.ServerCredentials;
 import io.grpc.TlsServerCredentials;
 import io.grpc.protobuf.services.HealthStatusManager;
@@ -110,18 +113,35 @@ public class TikaGrpcServer {
         File tikaConfigFile = new File(tikaConfig.getAbsolutePath());
         healthStatusManager.setStatus(TikaGrpcServer.class.getSimpleName(), ServingStatus.SERVING);
         serviceImpl = new TikaGrpcServerImpl(tikaConfigFile.getAbsolutePath(), pluginRoots);
-        // v1 (tika.Tika) stays the stable fields-map contract; v2 (TikaV2) is the
-        // experimental typed Document surface. Both share the same pipes runtime.
-        server = Grpc
-                .newServerBuilderForPort(port, creds)
-                .addService(serviceImpl)
-                .addService(new TikaGrpcV2ServerImpl(serviceImpl))
-                .addService(healthStatusManager.getHealthService())
-                .addService(ProtoReflectionServiceV1.newInstance())
-                .build()
-                .start();
-        // port 0 asks the OS to pick one; adopt what it actually bound
-        port = server.getPort();
+        try {
+            ServerBuilder<?> serverBuilder = Grpc.newServerBuilderForPort(port, creds);
+            applyInboundLimit(serverBuilder, serviceImpl.tikaGrpcConfig);
+            for (String warning : startupWarnings(
+                    serviceImpl.tikaGrpcConfig.getMaxInboundMessageBytes(),
+                    serviceImpl.tikaGrpcConfig.effectiveParseBytesMaxContentBytes(),
+                    Runtime.getRuntime().maxMemory())) {
+                LOGGER.warn(warning);
+            }
+            // v1 (tika.Tika) stays the stable fields-map contract; v2 (TikaV2) is the
+            // experimental typed Document surface. Both share the same pipes runtime.
+            server = serverBuilder
+                    .addService(serviceImpl)
+                    .addService(new TikaGrpcV2ServerImpl(serviceImpl))
+                    .addService(healthStatusManager.getHealthService())
+                    .addService(ProtoReflectionServiceV1.newInstance())
+                    .build()
+                    .start();
+            // port 0 asks the OS to pick one; adopt what it actually bound
+            port = server.getPort();
+        } catch (Exception e) {
+            // The impl is built before the server is, and nothing else holds it: a refused
+            // credential set or a port already in use must not leave its pipes pool and
+            // spool directory behind.
+            serviceImpl.shutdown();
+            serviceImpl.postShutdown();
+            serviceImpl = null;
+            throw e;
+        }
         LOGGER.info("Server started, listening on " + port);
         Runtime
                 .getRuntime()
@@ -196,6 +216,91 @@ public class TikaGrpcServer {
             throw new IllegalArgumentException(
                     "Tika config file is required. Use -c to specify a config file.", e);
         }
+    }
+
+    /**
+     * Applies the configured inbound limit, if any. Without the knob the builder keeps
+     * gRPC's own default.
+     */
+    static void applyInboundLimit(ServerBuilder<?> builder, TikaGrpcConfig config) {
+        Integer maxInboundMessageBytes = config.getMaxInboundMessageBytes();
+        if (maxInboundMessageBytes != null) {
+            builder.maxInboundMessageSize(maxInboundMessageBytes);
+        }
+    }
+
+    /**
+     * The warning an operator needs when they have configured a transport limit that puts
+     * the ParseBytes content cap out of reach, or {@code null} when there is nothing to
+     * say.
+     *
+     * <p>Equality warns too: a request carrying exactly the cap also carries its field
+     * tags, length prefixes and remaining fields, so it exceeds the envelope.
+     *
+     * <p>No warning does not mean the cap is reachable: the rest of the request
+     * ({@code parse_context_json}) has no length limit. An absent knob does not warn.
+     */
+    static String inertCapWarning(Integer maxInboundMessageBytes,
+                                  long parseBytesMaxContentBytes) {
+        if (maxInboundMessageBytes == null
+                || maxInboundMessageBytes > parseBytesMaxContentBytes) {
+            return null;
+        }
+        return "ParseBytes accepts content up to " + parseBytesMaxContentBytes
+                + " bytes, but this server's maxInboundMessageBytes is "
+                + maxInboundMessageBytes + ". The request also has to carry its other "
+                + "fields, so the transport refuses before the ParseBytes bound applies.";
+    }
+
+    /**
+     * How much heap one in-flight request of the configured size wants, as a multiple of
+     * that size. A unary request is assembled into a byte array and then handed to
+     * protobuf, on top of the transport's own buffers, so two is the bare minimum and
+     * three leaves a little room. It is a floor for a <em>single</em> request; concurrent
+     * requests multiply it and nothing here caps how many there are.
+     */
+    private static final int HEAP_HEADROOM_MULTIPLE = 3;
+
+    /**
+     * The warnings worth emitting at startup about the configured message limits, in the
+     * order they should be logged, or an empty list when there is nothing to report.
+     */
+    static List<String> startupWarnings(Integer maxInboundMessageBytes,
+                                        long parseBytesMaxContentBytes, long maxHeapBytes) {
+        List<String> warnings = new ArrayList<>(2);
+        String inertCap = inertCapWarning(maxInboundMessageBytes, parseBytesMaxContentBytes);
+        if (inertCap != null) {
+            warnings.add(inertCap);
+        }
+        String heapHeadroom = heapHeadroomWarning(maxInboundMessageBytes, maxHeapBytes);
+        if (heapHeadroom != null) {
+            warnings.add(heapHeadroom);
+        }
+        return warnings;
+    }
+
+    /**
+     * The warning an operator needs when the configured message limit is large relative to
+     * the heap this JVM may use, or {@code null} when there is nothing to say.
+     *
+     * <p>This is the gRPC server's own heap, which is the one that matters: a unary
+     * request is materialised here in full before any handler runs. The forked pipes
+     * worker is a separate process with its own heap; ParseBytes sends it payloads up to
+     * {@code pipes.maxInlineBytes} with the request and spools larger ones to a file.
+     */
+    static String heapHeadroomWarning(Integer maxInboundMessageBytes, long maxHeapBytes) {
+        if (maxInboundMessageBytes == null || maxHeapBytes == Long.MAX_VALUE) {
+            return null;
+        }
+        long wanted = (long) maxInboundMessageBytes * HEAP_HEADROOM_MULTIPLE;
+        if (maxHeapBytes >= wanted) {
+            return null;
+        }
+        return "maxInboundMessageBytes is " + maxInboundMessageBytes + " but this JVM's "
+                + "maximum heap is " + maxHeapBytes + ". A request is held in memory in "
+                + "full before parsing starts, so one of that size wants around "
+                + wanted + " bytes, and concurrent requests want that much each. Either "
+                + "raise the heap or lower the limit.";
     }
 
     public TikaGrpcServer setTikaConfig(File tikaConfig) {

@@ -1,5 +1,12 @@
 Release 4.2.0 - unreleased
 
+   * tika-grpc: ParseBytes on the experimental TikaV2 service parses bytes the
+     caller already holds; Tika fetches nothing. Payloads up to
+     pipes.maxInlineBytes go to the parser process inline, larger ones through
+     a spool file, and the result always comes back in the reply. Knobs in the
+     "grpc" section: parseBytesMaxContentBytes (64 MiB by default) and
+     maxInboundMessageBytes (TIKA-4795).
+
    * tika-grpc: experimental TikaV2 service on the same port as the existing
      one. Its FetchAndParse replies carry a typed Document with the content
      type, metadata, parse status and source origin, but not the extracted
