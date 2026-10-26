@@ -17,6 +17,7 @@
 package org.apache.tika.pipes.grpc;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -1140,6 +1141,47 @@ public class TikaGrpcServerTest {
         assertEquals("https://example.com/page.html", document.getOrigin().getSourceUri());
     }
 
+    /**
+     * A document the parser cannot read comes back as a failed Document whose errors say
+     * what the parser threw, not only that there was no metadata.
+     */
+    @Test
+    public void testParseBytesReportsWhyAParseFailed(Resources resources) throws Exception {
+        ManagedChannel channel = startChannel(resources, tikaConfig);
+        TikaV2ServiceGrpc.TikaV2ServiceBlockingStub v2 = TikaV2ServiceGrpc.newBlockingStub(channel);
+
+        ParseBytesResponse reply = v2.parseBytes(ParseBytesRequest.newBuilder()
+                .setCorrelationId("broken-1")
+                .setContent(ByteString.copyFromUtf8("%PDF-1.7\nthis is not a PDF body\n"))
+                .setResourceName("broken.pdf")
+                .build());
+
+        org.apache.tika.grpc.v2.ParseStatus status = reply.getDocument().getStatus();
+        assertNotEquals(org.apache.tika.grpc.v2.ParseStatus.Status.STATUS_SUCCESS,
+                status.getStatus(), "pipes status " + status.getPipesStatus());
+        assertEquals(1, status.getErrorsCount(), "errors=" + status.getErrorsList());
+        assertTrue(status.getErrors(0).contains("Exception"),
+                "the error names what was thrown, got: " + status.getErrors(0));
+    }
+
+    /** A document with no text is a clean success, with no errors. */
+    @Test
+    public void testParseBytesOfABlankDocumentSucceedsWithoutErrors(Resources resources)
+            throws Exception {
+        ManagedChannel channel = startChannel(resources, tikaConfig);
+        TikaV2ServiceGrpc.TikaV2ServiceBlockingStub v2 = TikaV2ServiceGrpc.newBlockingStub(channel);
+
+        ParseBytesResponse reply = v2.parseBytes(ParseBytesRequest.newBuilder()
+                .setContent(ByteString.copyFromUtf8("   \n"))
+                .setResourceName("blank.txt")
+                .build());
+
+        org.apache.tika.grpc.v2.ParseStatus status = reply.getDocument().getStatus();
+        assertEquals(org.apache.tika.grpc.v2.ParseStatus.Status.STATUS_SUCCESS,
+                status.getStatus(), "pipes status " + status.getPipesStatus());
+        assertTrue(status.getErrorsList().isEmpty(), "errors=" + status.getErrorsList());
+    }
+
     @Test
     public void testParseBytesReturnsTheTrimmedResourceName(Resources resources) throws Exception {
         ManagedChannel channel = startChannel(resources, tikaConfig);
@@ -1376,6 +1418,13 @@ public class TikaGrpcServerTest {
                             .setFetchKey("parse-bytes-probe")
                             .build()));
             assertEquals(Status.Code.UNKNOWN, ex.getStatus().getCode(), "fetch " + id);
+            StatusRuntimeException v2Ex = Assertions.assertThrows(StatusRuntimeException.class,
+                    () -> v2.fetchAndParse(org.apache.tika.grpc.v2.FetchAndParseRequest
+                            .newBuilder()
+                            .setFetcherId(id)
+                            .setFetchKey("parse-bytes-probe")
+                            .build()));
+            assertEquals(Status.Code.NOT_FOUND, v2Ex.getStatus().getCode(), "v2 fetch " + id);
         }
 
         ParseBytesResponse reply = v2.parseBytes(ParseBytesRequest.newBuilder()
