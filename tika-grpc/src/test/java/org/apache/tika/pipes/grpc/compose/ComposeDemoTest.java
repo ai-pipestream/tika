@@ -22,14 +22,22 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
+import com.google.protobuf.Descriptors;
+import com.google.protobuf.DynamicMessage;
 import io.grpc.ManagedChannel;
 import io.grpc.Server;
 import io.grpc.inprocess.InProcessChannelBuilder;
 import io.grpc.inprocess.InProcessServerBuilder;
 import io.grpc.protobuf.services.ProtoReflectionServiceV1;
+import io.grpc.reflection.v1.FileDescriptorResponse;
+import io.grpc.reflection.v1.ServerReflectionGrpc;
+import io.grpc.reflection.v1.ServerReflectionRequest;
+import io.grpc.reflection.v1.ServerReflectionResponse;
 import io.grpc.stub.StreamObserver;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -39,6 +47,7 @@ import org.apache.tika.grpc.v2.ExtensionResult;
 import org.apache.tika.grpc.v2.ParseBytesRequest;
 import org.apache.tika.grpc.v2.ParseBytesResponse;
 import org.apache.tika.grpc.v2.SourceOrigin;
+import org.apache.tika.grpc.v2.TikaV2Proto;
 import org.apache.tika.grpc.v2.TikaV2ServiceGrpc;
 
 /**
@@ -148,5 +157,69 @@ class ComposeDemoTest {
                 "org.apache.tika.grpc.v2.TikaV2Service/ParseBytes", 5000);
         assertThrows(IllegalArgumentException.class,
                 () -> call.call("", "resource_name", CONTENT, 5000));
+    }
+
+    /**
+     * A reflection server that answers with only the file asked for, as tonic (Rust) does:
+     * the composer fetches the missing dependencies by name.
+     */
+    @Test
+    void fetchesDependenciesAReflectionServerLeavesOut() throws Exception {
+        String name = InProcessServerBuilder.generateName();
+        Server server = InProcessServerBuilder.forName(name)
+                .addService(new FakeParser("external/x"))
+                .addService(new FileOnlyReflection())
+                .build()
+                .start();
+        closeables.add(() -> server.shutdownNow().awaitTermination(5, TimeUnit.SECONDS));
+        ManagedChannel external = InProcessChannelBuilder.forName(name).build();
+        closeables.add(0, () -> external.shutdownNow().awaitTermination(5, TimeUnit.SECONDS));
+
+        ReflectiveUnaryCall call = ReflectiveUnaryCall.resolve(external,
+                "org.apache.tika.grpc.v2.TikaV2Service/ParseBytes", 5000);
+        DynamicMessage reply = call.call("", null, CONTENT, 5000);
+
+        assertEquals("org.apache.tika.grpc.v2.ParseBytesResponse",
+                reply.getDescriptorForType().getFullName());
+    }
+
+    /** Serves each file without its dependencies, from the files linked into this test. */
+    private static final class FileOnlyReflection extends ServerReflectionGrpc.ServerReflectionImplBase {
+        private static final Map<String, Descriptors.FileDescriptor> FILES = new HashMap<>();
+
+        static {
+            add(TikaV2Proto.getDescriptor());
+        }
+
+        private static void add(Descriptors.FileDescriptor file) {
+            FILES.put(file.getName(), file);
+            file.getDependencies().forEach(FileOnlyReflection::add);
+        }
+
+        @Override
+        public StreamObserver<ServerReflectionRequest> serverReflectionInfo(
+                StreamObserver<ServerReflectionResponse> responses) {
+            return new StreamObserver<>() {
+                @Override
+                public void onNext(ServerReflectionRequest request) {
+                    Descriptors.FileDescriptor file = request.hasFileByFilename()
+                            ? FILES.get(request.getFileByFilename())
+                            : TikaV2Proto.getDescriptor();
+                    responses.onNext(ServerReflectionResponse.newBuilder()
+                            .setFileDescriptorResponse(FileDescriptorResponse.newBuilder()
+                                    .addFileDescriptorProto(file.toProto().toByteString()))
+                            .build());
+                }
+
+                @Override
+                public void onError(Throwable t) {
+                }
+
+                @Override
+                public void onCompleted() {
+                    responses.onCompleted();
+                }
+            };
+        }
     }
 }

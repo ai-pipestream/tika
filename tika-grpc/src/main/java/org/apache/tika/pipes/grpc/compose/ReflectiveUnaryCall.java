@@ -23,7 +23,10 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import com.google.protobuf.ByteString;
 import com.google.protobuf.DescriptorProtos.FileDescriptorProto;
@@ -154,13 +157,62 @@ final class ReflectiveUnaryCall {
         return fields.stream().map(Descriptors.FieldDescriptor::getName).toList();
     }
 
-    /** Fetches the file that defines {@code symbol}, with its dependencies, by reflection. */
+    /**
+     * Fetches the file that defines {@code symbol}, and its dependencies, by reflection.
+     * grpc-java sends the dependencies with the file; tonic (Rust) sends only the file
+     * asked for, so any dependency still missing is then fetched by name.
+     */
     private static FileDescriptor fetchFile(Channel channel, String symbol, long timeoutMs)
             throws IOException, InterruptedException {
         Map<String, FileDescriptorProto> protos = new HashMap<>();
-        List<String> order = new ArrayList<>();
-        java.util.concurrent.CompletableFuture<Void> done =
-                new java.util.concurrent.CompletableFuture<>();
+        List<FileDescriptorProto> first = request(channel, ServerReflectionRequest.newBuilder()
+                .setFileContainingSymbol(symbol).build(), timeoutMs);
+        if (first.isEmpty()) {
+            throw new IOException("reflection returned no file for " + symbol);
+        }
+        for (FileDescriptorProto proto : first) {
+            protos.putIfAbsent(proto.getName(), proto);
+        }
+        List<String> missing = missingDependencies(protos);
+        while (!missing.isEmpty()) {
+            for (String name : missing) {
+                List<FileDescriptorProto> files = request(channel, ServerReflectionRequest
+                        .newBuilder().setFileByFilename(name).build(), timeoutMs);
+                for (FileDescriptorProto proto : files) {
+                    protos.putIfAbsent(proto.getName(), proto);
+                }
+                if (!protos.containsKey(name)) {
+                    throw new IOException("reflection did not send dependency " + name);
+                }
+            }
+            missing = missingDependencies(protos);
+        }
+        try {
+            return build(first.get(0).getName(), protos, new HashMap<>());
+        } catch (Descriptors.DescriptorValidationException e) {
+            throw new IOException("invalid descriptor from reflection", e);
+        }
+    }
+
+    private static List<String> missingDependencies(Map<String, FileDescriptorProto> protos) {
+        List<String> missing = new ArrayList<>();
+        for (FileDescriptorProto proto : protos.values()) {
+            for (String dependency : proto.getDependencyList()) {
+                if (!protos.containsKey(dependency) && !missing.contains(dependency)) {
+                    missing.add(dependency);
+                }
+            }
+        }
+        return missing;
+    }
+
+    /** Sends one reflection request on its own stream and returns the files it answers with. */
+    private static List<FileDescriptorProto> request(Channel channel,
+                                                     ServerReflectionRequest request,
+                                                     long timeoutMs)
+            throws IOException, InterruptedException {
+        List<FileDescriptorProto> files = new ArrayList<>();
+        CompletableFuture<Void> done = new CompletableFuture<>();
         StreamObserver<ServerReflectionRequest> requests = ServerReflectionGrpc
                 .newStub(channel)
                 .withDeadlineAfter(timeoutMs, TimeUnit.MILLISECONDS)
@@ -175,10 +227,7 @@ final class ReflectiveUnaryCall {
                         try {
                             for (ByteString bytes : response.getFileDescriptorResponse()
                                     .getFileDescriptorProtoList()) {
-                                FileDescriptorProto proto = FileDescriptorProto.parseFrom(bytes);
-                                if (protos.putIfAbsent(proto.getName(), proto) == null) {
-                                    order.add(proto.getName());
-                                }
+                                files.add(FileDescriptorProto.parseFrom(bytes));
                             }
                         } catch (InvalidProtocolBufferException e) {
                             done.completeExceptionally(e);
@@ -195,26 +244,16 @@ final class ReflectiveUnaryCall {
                         done.complete(null);
                     }
                 });
-        // The server sends the defining file and its transitive dependencies.
-        requests.onNext(ServerReflectionRequest.newBuilder()
-                .setFileContainingSymbol(symbol).build());
+        requests.onNext(request);
         requests.onCompleted();
         try {
             done.get(timeoutMs, TimeUnit.MILLISECONDS);
-        } catch (java.util.concurrent.ExecutionException e) {
-            throw new IOException("reflection lookup of " + symbol + " failed", e.getCause());
-        } catch (java.util.concurrent.TimeoutException e) {
-            throw new IOException("reflection lookup of " + symbol + " timed out", e);
+        } catch (ExecutionException e) {
+            throw new IOException("reflection request failed: " + request, e.getCause());
+        } catch (TimeoutException e) {
+            throw new IOException("reflection request timed out: " + request, e);
         }
-        if (order.isEmpty()) {
-            throw new IOException("reflection returned no file for " + symbol);
-        }
-        Map<String, FileDescriptor> built = new HashMap<>();
-        try {
-            return build(order.get(0), protos, built);
-        } catch (Descriptors.DescriptorValidationException e) {
-            throw new IOException("invalid descriptor from reflection", e);
-        }
+        return files;
     }
 
     private static FileDescriptor build(String name, Map<String, FileDescriptorProto> protos,
