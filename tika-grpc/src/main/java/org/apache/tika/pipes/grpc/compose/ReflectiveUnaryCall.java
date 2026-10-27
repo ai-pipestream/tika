@@ -94,7 +94,7 @@ final class ReflectiveUnaryCall {
 
     /**
      * Builds the request from {@code requestJson} (may be blank), sets {@code content} on
-     * the bytes field named {@code bytesField}, and returns the reply.
+     * the bytes field {@link #bytesField} picks, and returns the reply.
      */
     DynamicMessage call(String requestJson, String bytesField, byte[] content, long timeoutMs)
             throws InvalidProtocolBufferException {
@@ -103,12 +103,7 @@ final class ReflectiveUnaryCall {
         if (requestJson != null && !requestJson.isBlank()) {
             JsonFormat.parser().merge(requestJson, request);
         }
-        Descriptors.FieldDescriptor field = requestType.findFieldByName(bytesField);
-        if (field == null || field.getType() != Descriptors.FieldDescriptor.Type.BYTES
-                || field.isRepeated()) {
-            throw new IllegalArgumentException(requestType.getFullName()
-                    + " has no single bytes field named '" + bytesField + "'");
-        }
+        Descriptors.FieldDescriptor field = bytesField(requestType, bytesField);
         request.setField(field, ByteString.copyFrom(content));
         io.grpc.MethodDescriptor<DynamicMessage, DynamicMessage> grpcMethod =
                 io.grpc.MethodDescriptor.<DynamicMessage, DynamicMessage>newBuilder()
@@ -121,6 +116,42 @@ final class ReflectiveUnaryCall {
         return ClientCalls.blockingUnaryCall(channel, grpcMethod,
                 CallOptions.DEFAULT.withDeadlineAfter(timeoutMs, TimeUnit.MILLISECONDS),
                 request.build());
+    }
+
+    /**
+     * The request field that gets the document bytes: the one named {@code name}, or, when
+     * {@code name} is blank, the request's only singular bytes field (FastWARC's
+     * {@code ParseArchiveRequest.archive}, for example).
+     */
+    static Descriptors.FieldDescriptor bytesField(Descriptors.Descriptor requestType,
+                                                  String name) {
+        List<Descriptors.FieldDescriptor> candidates = new ArrayList<>();
+        for (Descriptors.FieldDescriptor field : requestType.getFields()) {
+            if (field.getType() == Descriptors.FieldDescriptor.Type.BYTES
+                    && !field.isRepeated()) {
+                candidates.add(field);
+            }
+        }
+        if (name != null && !name.isBlank()) {
+            for (Descriptors.FieldDescriptor field : candidates) {
+                if (field.getName().equals(name)) {
+                    return field;
+                }
+            }
+            throw new IllegalArgumentException(requestType.getFullName()
+                    + " has no single bytes field named '" + name + "'; bytes fields: "
+                    + names(candidates));
+        }
+        if (candidates.size() != 1) {
+            throw new IllegalArgumentException(requestType.getFullName() + " has "
+                    + candidates.size() + " bytes fields " + names(candidates)
+                    + "; pick one with --bytes-field");
+        }
+        return candidates.get(0);
+    }
+
+    private static List<String> names(List<Descriptors.FieldDescriptor> fields) {
+        return fields.stream().map(Descriptors.FieldDescriptor::getName).toList();
     }
 
     /** Fetches the file that defines {@code symbol}, with its dependencies, by reflection. */

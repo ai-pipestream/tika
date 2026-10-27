@@ -104,7 +104,8 @@ class ComposeDemoTest {
         ManagedChannel external = start(new FakeParser("external/x"), true);
 
         ComposeDemo.Composed composed = new ComposeDemo()
-                .method("org.apache.tika.grpc.v2.TikaV2Service/ParseBytes", "content", "fake")
+                // No bytes field named: ParseBytesRequest has exactly one, content.
+                .method("org.apache.tika.grpc.v2.TikaV2Service/ParseBytes", null, "fake")
                 .compose(tika, external, CONTENT, "crawl.warc");
 
         Document document = composed.document();

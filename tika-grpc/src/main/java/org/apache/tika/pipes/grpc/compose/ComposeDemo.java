@@ -48,7 +48,7 @@ import org.apache.tika.grpc.v2.TikaV2ServiceGrpc;
  * The external parser needs no Tika-specific code, only gRPC reflection. Example:
  * <pre>
  * ComposeDemo --file crawl.warc.gz --external localhost:50060 \
- *     --method fastwarc.v1.WarcService/ParseArchive --bytes-field content --producer fastwarc
+ *     --method fastwarc.v1.WarcService/ParseArchive --producer fastwarc
  * </pre>
  */
 public final class ComposeDemo {
@@ -66,8 +66,9 @@ public final class ComposeDemo {
             description = "Unary method, package.Service/Method")
     private String method;
 
-    @Parameter(names = "--bytes-field", description = "Request field that gets the file bytes")
-    private String bytesField = "content";
+    @Parameter(names = "--bytes-field", description = "Request field that gets the file "
+            + "bytes; defaults to the request's only bytes field")
+    private String bytesField;
 
     @Parameter(names = "--request-json", description = "Other request fields, as JSON")
     private String requestJson = "";
