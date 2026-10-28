@@ -78,6 +78,7 @@
           <protoSourceRoot>${project.basedir}/src/main/proto</protoSourceRoot>
           <includes>
             <include>org/apache/tika/grpc/v2alpha1/*.proto</include>
+            <include>org/apache/tika/grpc/messages/v2alpha1/*.proto</include>
           </includes>
           <writeDescriptorSet>true</writeDescriptorSet>
           <includeDependenciesInDescriptorSet>true</includeDependenciesInDescriptorSet>

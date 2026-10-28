@@ -114,6 +114,7 @@ public class TikaGrpcServer {
                 .newServerBuilderForPort(port, creds)
                 .addService(serviceImpl)
                 .addService(new TikaV2Alpha1ServerImpl(serviceImpl.runtime))
+                .addService(new MessageParserServiceImpl(MessageParsers.fromClasspath()))
                 .addService(healthStatusManager.getHealthService())
                 .addService(ProtoReflectionServiceV1.newInstance())
                 .build()

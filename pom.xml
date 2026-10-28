@@ -55,6 +55,7 @@
     <module>tika-pipes</module>
 
     <module>tika-grpc-api</module>
+    <module>tika-grpc-message-parser</module>
     <module>tika-grpc</module>
     <module>tika-app</module>
     <module>tika-server</module>

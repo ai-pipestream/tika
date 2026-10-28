@@ -112,6 +112,19 @@ xref:advanced/setting-limits.adoc#_exception_reporting[`parse-context.exception-
 The v2alpha1 service goes through the same capability flags and request checks as v1. Fetchers are
 still managed through v1 (`SaveFetcher` and related RPCs).
 
+=== Parsing your own protobuf messages
+
+`org.apache.tika.grpc.messages.v2alpha1.MessageParserService` runs on the same port. Its
+`ParseMessage`, `ParseMessageStream` and `ParseMessageBidi` take a protobuf message the client
+already has, as a `google.protobuf.Any`, and return a `/rmeta`-shaped list of documents whose metadata is a `google.protobuf.Struct`
+(numbers, booleans, nested JSON and lists as themselves, everything else as Tika's string). The message is
+parsed by a `MessageParser<T extends Message>` from `tika-grpc-message-parser`: a plugin jar with
+the message's generated stubs and a parser that maps the message into Tika `Metadata`, found
+through `ServiceLoader`. The parser's `properties()` give the types of keys the registry does not
+declare. A message with no parser for its type is `NOT_FOUND`; a message that does not
+unpack, or that the parser rejects, is `INVALID_ARGUMENT`. The streaming and bidi RPCs behave as
+their `FetchAndParse` counterparts. See `tika-grpc-message-parser/README.md` for how to write one.
+
 == Command-line options
 
 [cols="1,3"]
