@@ -1,0 +1,70 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+// Subset of fastwarc-grpc 1.1.0's proto/fastwarc/v1/warc_service.proto
+// (Apache-2.0): the unary ParseArchive method and the messages it uses, with
+// their package, names and field numbers unchanged, so the adapter speaks the
+// real service's wire format. The streaming ParseWarc method and the config
+// fields the adapter does not set are left out (their numbers are reserved
+// here so they are never reused); java_package is added.
+//
+// Pinned to the fastwarc-grpc v1.1.0 release. To move to a later release,
+// copy the same messages from its proto/fastwarc/v1/ and keep the numbers.
+
+syntax = "proto3";
+
+package fastwarc.v1;
+
+import "fastwarc/v1/warc.proto";
+
+option java_multiple_files = true;
+option java_package = "org.apache.tika.grpc.adapter.fastwarc.v1";
+
+service WarcService {
+  rpc ParseArchive(ParseArchiveRequest) returns (ParseArchiveResponse);
+}
+
+message ParseWarcConfig {
+  optional bool parse_http = 1;
+  bool verify_digests = 3;
+  bool quirks_mode = 4;
+  optional bool include_payload = 13;
+  optional bool include_headers = 14;
+  // Set in fastwarc-grpc, not by this adapter.
+  reserved 2, 5 to 12;
+}
+
+message ParseArchiveRequest {
+  ParseWarcConfig config = 1;
+  bytes archive = 2;
+}
+
+message ParsedRecord {
+  RecordMetadata metadata = 1;
+  bytes payload = 2;
+}
+
+message RecordError {
+  uint64 stream_pos = 1;
+  bool recoverable = 2;
+  string message = 3;
+}
+
+message ParseArchiveResponse {
+  repeated ParsedRecord records = 1;
+  repeated RecordError errors = 2;
+}

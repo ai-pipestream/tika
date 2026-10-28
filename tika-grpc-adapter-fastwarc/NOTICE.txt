@@ -1,0 +1,10 @@
+Apache Tika gRPC adapter for FastWARC
+Copyright 2026 The Apache Software Foundation
+
+This product includes software developed at
+The Apache Software Foundation (http://www.apache.org/).
+
+The protocol buffer definitions in src/main/proto/fastwarc/v1 are a subset of
+those published by fastwarc-grpc 1.1.0 (https://github.com/ai-pipestream),
+licensed under the Apache License, Version 2.0. Package, message names and
+field numbers are unchanged.
