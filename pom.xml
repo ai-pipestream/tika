@@ -69,6 +69,14 @@
   </modules>
 
   <profiles>
+    <!-- Fork only: the FastWARC adapter (TIKA-4951) is a separate project built on the
+         tika-grpc adapter SPI; mvn -Pfastwarc-adapter builds it with the rest. -->
+    <profile>
+      <id>fastwarc-adapter</id>
+      <modules>
+        <module>tika-grpc-adapter-fastwarc</module>
+      </modules>
+    </profile>
     <profile>
       <id>e2e</id>
       <modules>

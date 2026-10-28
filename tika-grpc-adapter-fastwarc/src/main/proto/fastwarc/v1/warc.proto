@@ -1,0 +1,68 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+// Copy of the WARC record model from fastwarc-grpc 1.1.0
+// (proto/fastwarc/v1/warc.proto, Apache-2.0), with its package, names and field
+// numbers unchanged, so the adapter speaks the real service's wire format. Only
+// java_package is added.
+
+syntax = "proto3";
+
+package fastwarc.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option java_multiple_files = true;
+option java_package = "org.apache.tika.grpc.adapter.fastwarc.v1";
+
+enum WarcRecordType {
+  WARC_RECORD_TYPE_UNSPECIFIED = 0;
+  WARC_RECORD_TYPE_WARCINFO = 1;
+  WARC_RECORD_TYPE_RESPONSE = 2;
+  WARC_RECORD_TYPE_RESOURCE = 3;
+  WARC_RECORD_TYPE_REQUEST = 4;
+  WARC_RECORD_TYPE_METADATA = 5;
+  WARC_RECORD_TYPE_REVISIT = 6;
+  WARC_RECORD_TYPE_CONVERSION = 7;
+  WARC_RECORD_TYPE_CONTINUATION = 8;
+  WARC_RECORD_TYPE_UNKNOWN = 32768;
+}
+
+message HeaderField {
+  bytes name = 1;
+  bytes value = 2;
+}
+
+message HeaderBlock {
+  optional bytes status_line = 1;
+  repeated HeaderField fields = 2;
+  bytes raw_block = 3;
+}
+
+message RecordMetadata {
+  WarcRecordType record_type = 1;
+  HeaderBlock warc_headers = 2;
+  uint64 content_length = 3;
+  uint64 stream_pos = 4;
+  bool is_http = 5;
+  bool http_parsed = 6;
+  optional HeaderBlock http_headers = 7;
+  optional string http_content_type = 8;
+  optional string http_charset = 9;
+  optional string record_id = 10;
+  optional google.protobuf.Timestamp record_date = 11;
+}
