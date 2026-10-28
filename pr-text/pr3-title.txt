@@ -1,0 +1,1 @@
+TIKA-4771, TIKA-4951: external parser adapters for tika-grpc ParseBytes

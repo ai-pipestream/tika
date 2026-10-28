@@ -1,0 +1,1 @@
+TIKA-4795: ParseBytes, parse bytes the caller already has
